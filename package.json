@@ -1,0 +1,58 @@
+{
+  "name": "@saleem11kh/repomem",
+  "version": "0.1.1",
+  "description": "Git-native memory for AI coding agents. .repomem/ commits with your code, clones with your team, works with Claude Code, Cursor, Gemini CLI and more.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "repomem": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "rimraf dist && tsc",
+    "dev": "ts-node src/cli.ts",
+    "start": "node dist/cli.js",
+    "test": "npm run build && node --test",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "claude-code",
+    "cursor",
+    "gemini-cli",
+    "codex",
+    "ai-agent",
+    "memory",
+    "context",
+    "developer-tools",
+    "git",
+    "multi-repo",
+    "team-memory"
+  ],
+  "author": "Saleem Khan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saleem786khan/repomem.git"
+  },
+  "bugs": {
+    "url": "https://github.com/saleem786khan/repomem/issues"
+  },
+  "homepage": "https://github.com/saleem786khan/repomem#readme",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "rimraf": "^6.1.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
+  }
+}
