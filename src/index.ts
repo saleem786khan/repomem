@@ -15,7 +15,7 @@ import { memHandoff } from "./tools/mem-handoff.js";
 const TOOLS: ToolDef[] = [memSave, memSearch, memContext, memHandoff];
 const TOOL_MAP = new Map(TOOLS.map((t) => [t.name, t]));
 
-const VERSION = "0.1.1";
+const VERSION = "0.2.0";
 
 /** Build and start the repomem MCP server over stdio. */
 export async function startServer(): Promise<void> {
