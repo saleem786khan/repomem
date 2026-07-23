@@ -8,7 +8,10 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
+const { execFileSync } = require("node:child_process");
+
 const store = require("../dist/store/file-store.js");
+const remote = require("../dist/store/remote.js");
 const config = require("../dist/config/config.js");
 const util = require("../dist/tools/util.js");
 const { memSave } = require("../dist/tools/mem-save.js");
@@ -243,4 +246,166 @@ test("mem_handoff requires a summary", () => {
   const root = makeProject();
   const out = memHandoff.handler({}, root);
   assert.match(out, /summary is required/);
+});
+
+// ---------------------------------------------------------------------------
+// cli setup — runs the shipped CLI as a subprocess and checks the files each
+// agent actually reads for project-scoped MCP servers.
+// ---------------------------------------------------------------------------
+const CLI = path.join(__dirname, "..", "dist", "cli.js");
+function runCli(root, ...args) {
+  return execFileSync(process.execPath, [CLI, ...args], { cwd: root, encoding: "utf8" });
+}
+
+test("cli setup claude-code writes .mcp.json at repo root (not .claude/)", () => {
+  const root = makeProject();
+  runCli(root, "setup", "claude-code");
+  assert.ok(!fs.existsSync(path.join(root, ".claude", "mcp.json")), "must not use .claude/mcp.json");
+  const cfg = JSON.parse(fs.readFileSync(path.join(root, ".mcp.json"), "utf8"));
+  assert.equal(cfg.mcpServers.repomem.command, "npx");
+  assert.deepEqual(cfg.mcpServers.repomem.args, ["@saleem11kh/repomem"]);
+});
+
+test("cli setup codex writes TOML and is idempotent", () => {
+  const root = makeProject();
+  runCli(root, "setup", "codex");
+  const tomlPath = path.join(root, ".codex", "config.toml");
+  const toml = fs.readFileSync(tomlPath, "utf8");
+  assert.match(toml, /^\[mcp_servers\.repomem\]/m);
+  assert.match(toml, /command = "npx"/);
+  assert.match(toml, /args = \["@saleem11kh\/repomem"\]/);
+  // second run must not duplicate the block
+  const second = runCli(root, "setup", "codex");
+  assert.match(second, /already configured/);
+  assert.equal(fs.readFileSync(tomlPath, "utf8").match(/\[mcp_servers\.repomem\]/g).length, 1);
+});
+
+test("cli setup codex preserves existing TOML config", () => {
+  const root = makeProject();
+  fs.mkdirSync(path.join(root, ".codex"), { recursive: true });
+  const tomlPath = path.join(root, ".codex", "config.toml");
+  fs.writeFileSync(tomlPath, 'model = "gpt-5"\n');
+  runCli(root, "setup", "codex");
+  const toml = fs.readFileSync(tomlPath, "utf8");
+  assert.match(toml, /model = "gpt-5"/, "must keep pre-existing config");
+  assert.match(toml, /\[mcp_servers\.repomem\]/, "must add repomem block");
+});
+
+test("cli setup rejects an unknown agent", () => {
+  const root = makeProject();
+  assert.throws(() => runCli(root, "setup", "notanagent"));
+});
+
+// ---------------------------------------------------------------------------
+// search ranking — TF-IDF + recency
+// ---------------------------------------------------------------------------
+test("search ranks the rare, discriminating term above common-term spam", () => {
+  const root = makeProject();
+  for (let i = 0; i < 6; i++) {
+    store.writeFile("patterns", `2026-06-0${i + 1}-common.md`, "# c\nthe the the the service the", {}, root);
+  }
+  store.writeFile("decisions", "2026-06-01-rare.md", "# Rare\nthe kafka broker", {}, root);
+  const results = store.searchFiles("the kafka", root);
+  assert.ok(results[0].file.includes("rare"), "doc with rare term must rank first");
+});
+
+test("search applies a recency boost to newer memory", () => {
+  const root = makeProject();
+  store.writeFile("sessions", "2020-01-01-old.md", "# old\nrefactor the auth module", {}, root);
+  store.writeFile("sessions", "2026-07-01-new.md", "# new\nrefactor the auth module", {}, root);
+  const results = store.searchFiles("refactor auth", root);
+  assert.ok(results[0].file.includes("new"), "newer of two equal matches must rank first");
+});
+
+// ---------------------------------------------------------------------------
+// import — inverse of `repomem sync`
+// ---------------------------------------------------------------------------
+test("importBundle round-trips a sync export back into .repomem/", () => {
+  const root = makeProject();
+  const bundle = [
+    "# repomem export — demo",
+    "",
+    "## decisions",
+    "",
+    "### decisions/2026-06-01-pg.md",
+    "",
+    "# Use Postgres",
+    "ACID for the ledger.",
+    "",
+    "### patterns/2026-06-02-zod.md",
+    "",
+    "# Validate with zod",
+    "",
+  ].join("\n");
+  const written = store.importBundle(bundle, root);
+  assert.deepEqual(written.sort(), ["decisions/2026-06-01-pg.md", "patterns/2026-06-02-zod.md"]);
+  const pg = store.readFile("decisions", "2026-06-01-pg.md", root);
+  assert.match(pg, /^# Use Postgres/, "no leading blank line, front matter preserved");
+  assert.match(pg, /ACID for the ledger\./);
+});
+
+test("importBundle ignores unrecognised sections", () => {
+  const root = makeProject();
+  const written = store.importBundle("### notes/foo.md\n\nhello\n", root);
+  assert.deepEqual(written, []);
+});
+
+// ---------------------------------------------------------------------------
+// remote linked repos
+// ---------------------------------------------------------------------------
+test("remote.parseRemote recognises github specs and rejects local paths", () => {
+  assert.deepEqual(remote.parseRemote("github:acme/auth"), { owner: "acme", name: "auth", ref: "HEAD" });
+  assert.deepEqual(remote.parseRemote("github:acme/auth#dev"), { owner: "acme", name: "auth", ref: "dev" });
+  assert.deepEqual(remote.parseRemote("https://github.com/acme/auth/tree/main"), {
+    owner: "acme",
+    name: "auth",
+    ref: "main",
+  });
+  assert.equal(remote.parseRemote("../auth-service"), null);
+  assert.equal(remote.parseRemote("./local"), null);
+});
+
+test("searchAllRepos searches a pulled remote's cache with a [remote:] scope", () => {
+  const root = makeProject("@acme/payments");
+  store.writeFile("decisions", "2026-06-01-p.md", "# Pay\nuse stripe webhooks", {}, root);
+  const ref = remote.parseRemote("github:acme/auth");
+  const cacheRoot = store.remoteCacheRoot(root, ref);
+  store.writeFile("patterns", "2026-06-01-a.md", "# Auth\nstripe customer ids", {}, cacheRoot);
+
+  const cfg = { project: "payments", linked: [{ repo: "github:acme/auth" }] };
+  const results = store.searchAllRepos("stripe", root, cfg);
+  const scopes = results.map((r) => r.scope);
+  assert.ok(scopes.includes("[current]"));
+  assert.ok(scopes.includes("[remote:auth]"), "remote scope present");
+});
+
+test("fetchRemoteRepomem writes .repomem/ md files from the GitHub API", async () => {
+  const savedFetch = global.fetch;
+  const blob = Buffer.from("# Auth decision\nuse jwt\n", "utf8").toString("base64");
+  global.fetch = async (url) => {
+    if (String(url).includes("/git/trees/")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          tree: [
+            { path: ".repomem/decisions/2026-06-01-a.md", type: "blob", sha: "sha1" },
+            { path: "README.md", type: "blob", sha: "sha2" }, // must be ignored
+            { path: ".repomem/decisions", type: "tree", sha: "sha3" }, // dir, ignored
+          ],
+        }),
+      };
+    }
+    return { ok: true, status: 200, json: async () => ({ content: blob, encoding: "base64" }) };
+  };
+  try {
+    const dest = fs.mkdtempSync(path.join(os.tmpdir(), "repomem-remote-"));
+    const destRepomem = path.join(dest, ".repomem");
+    const count = await remote.fetchRemoteRepomem({ owner: "acme", name: "auth", ref: "HEAD" }, destRepomem);
+    assert.equal(count, 1, "only the one .repomem/*.md blob is written");
+    const written = fs.readFileSync(path.join(destRepomem, "decisions", "2026-06-01-a.md"), "utf8");
+    assert.match(written, /use jwt/);
+  } finally {
+    global.fetch = savedFetch;
+  }
 });

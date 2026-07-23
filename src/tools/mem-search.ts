@@ -4,9 +4,11 @@ import { ToolDef, str } from "./util.js";
 export const memSearch: ToolDef = {
   name: "mem_search",
   description:
-    "Search across all saved memory (decisions, sessions, patterns, issues). " +
-    "Set linked=true to also search linked repos and the workspace declared in " +
-    "repomem.config.json. Returns the top matches with a short excerpt each.",
+    "Search across all saved memory (decisions, sessions, patterns, issues), " +
+    "ranked by relevance (TF-IDF) and recency. Set linked=true to also search " +
+    "linked repos (local paths and remote GitHub repos pulled via `repomem pull`) " +
+    "and the workspace declared in repomem.config.json. Returns the top matches " +
+    "with a short excerpt each, labelled by source scope.",
   inputSchema: {
     type: "object",
     properties: {

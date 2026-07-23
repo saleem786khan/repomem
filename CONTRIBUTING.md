@@ -22,9 +22,10 @@ npm test
 ```
 src/
   index.ts          MCP server entry (stdio) — exports startServer()
-  cli.ts            bin entry: init / setup / status / sync; no args → MCP server
+  cli.ts            bin entry: init / setup / status / sync / import / pull; no args → MCP server
   config/config.ts  loads repomem.config.json, finds the project root
-  store/file-store.ts  the ONLY module that touches disk
+  store/file-store.ts  local disk store: read/write/search/index + import
+  store/remote.ts   remote linked repos: parse github specs, fetch .repomem/ from the GitHub API
   tools/            the 4 MCP tools (mem_save, mem_search, mem_context, mem_handoff)
 test/               node:test suite, run against the compiled dist/
 ```
@@ -33,9 +34,10 @@ test/               node:test suite, run against the compiled dist/
 
 These keep the codebase easy to evolve — please follow them in PRs:
 
-1. **All filesystem access goes through `src/store/file-store.ts`.** Tools and
-   the CLI contain logic only; they never read or write disk directly. This
-   makes the storage backend swappable later.
+1. **Filesystem access lives in the store layer (`src/store/`).** Tools contain
+   logic only and never touch disk; `file-store.ts` owns the local `.repomem/`
+   store and `remote.ts` owns fetching remote repos. This keeps the storage
+   backend swappable later.
 2. **Tools return plain text, never JSON blobs.** Agents read text naturally.
 3. **No bare `@modelcontextprotocol/sdk` imports** — the package's root CJS
    entry is missing. Always import from explicit subpaths

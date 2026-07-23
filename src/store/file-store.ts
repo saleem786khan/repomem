@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { findProjectRoot, loadConfig, RepomemConfig } from "../config/config.js";
+import { parseRemote, remoteSlug, RemoteRef } from "./remote.js";
 
 export type MemoryType = "decisions" | "sessions" | "patterns" | "issues";
 
@@ -106,47 +107,128 @@ function titleOf(raw: string, filename: string): string {
   return m ? m[1].trim() : filename.replace(/\.md$/, "");
 }
 
+// Recency boost: a fresh doc can score up to (1 + RECENCY_WEIGHT)× a stale one,
+// decaying with a ~RECENCY_HALFLIFE_DAYS half-life. Keeps yesterday's session
+// ahead of a year-old note when both match equally well.
+const RECENCY_WEIGHT = 0.5;
+const RECENCY_HALFLIFE_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+interface Doc {
+  file: string;
+  type: MemoryType;
+  filename: string;
+  raw: string;
+  counts: Map<string, number>;
+  length: number;
+  dateMs: number;
+}
+
+/** Best-effort timestamp for a memory: leading YYYY-MM-DD in the name, else mtime. */
+function docDateMs(type: MemoryType, filename: string, projectRoot: string): number {
+  const m = filename.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) {
+    const t = Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`);
+    if (!Number.isNaN(t)) return t;
+  }
+  try {
+    return fs.statSync(path.join(getRepomemRoot(projectRoot), type, filename)).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/** Count non-overlapping occurrences of `term` in `haystack` (already lower-cased). */
+function countTerm(haystack: string, term: string): number {
+  let n = 0;
+  let idx = haystack.indexOf(term);
+  while (idx !== -1) {
+    n += 1;
+    idx = haystack.indexOf(term, idx + term.length);
+  }
+  return n;
+}
+
 /**
- * Full-text search across all memory types in a single project root.
- * Naive case-insensitive term scoring — good enough for plain-markdown stores.
+ * Full-text search across all memory types in a single project root, ranked by
+ * TF-IDF (rarer query terms weigh more), normalised for document length, with a
+ * recency boost. Case-insensitive over plain-markdown stores.
  */
 function searchInRoot(
   query: string,
   scope: string,
   projectRoot: string
 ): SearchResult[] {
-  const terms = query
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((t) => t.length > 0);
+  const terms = [
+    ...new Set(
+      query
+        .toLowerCase()
+        .split(/\s+/)
+        .filter((t) => t.length > 0)
+    ),
+  ];
   if (terms.length === 0) return [];
 
-  const results: SearchResult[] = [];
+  // Pass 1: load matching docs and per-term frequencies.
+  const docs: Doc[] = [];
   for (const type of MEMORY_TYPES) {
     for (const filename of listFiles(type, projectRoot)) {
       const raw = readFile(type, filename, projectRoot);
       if (raw == null) continue;
       const haystack = raw.toLowerCase();
-      let score = 0;
+      const counts = new Map<string, number>();
+      let total = 0;
       for (const term of terms) {
-        let idx = haystack.indexOf(term);
-        while (idx !== -1) {
-          score += 1;
-          idx = haystack.indexOf(term, idx + term.length);
-        }
+        const c = countTerm(haystack, term);
+        if (c > 0) counts.set(term, c);
+        total += c;
       }
-      if (score === 0) continue;
-
-      const { body } = splitFrontMatter(raw);
-      const excerpt = makeExcerpt(body, terms);
-      results.push({
+      if (total === 0) continue;
+      docs.push({
         file: `${type}/${filename}`,
-        scope,
-        title: titleOf(raw, filename),
-        excerpt,
-        score,
+        type,
+        filename,
+        raw,
+        counts,
+        length: haystack.split(/\s+/).filter(Boolean).length || 1,
+        dateMs: docDateMs(type, filename, projectRoot),
       });
     }
+  }
+  if (docs.length === 0) return [];
+
+  // Pass 2: document frequency per term across the matched corpus.
+  const df = new Map<string, number>();
+  for (const doc of docs) {
+    for (const term of doc.counts.keys()) df.set(term, (df.get(term) ?? 0) + 1);
+  }
+  const n = docs.length;
+  const now = Date.now();
+
+  // Pass 3: score = Σ (sublinear-tf × idf), length-normalised, × recency boost.
+  // Sublinear tf (1 + ln tf) stops a doc that merely repeats a common term from
+  // outranking one that actually contains the rare, discriminating term.
+  const results: SearchResult[] = [];
+  for (const doc of docs) {
+    let score = 0;
+    for (const [term, tf] of doc.counts) {
+      const idf = Math.log(1 + n / (1 + (df.get(term) ?? 0)));
+      score += (1 + Math.log(tf)) * idf;
+    }
+    score /= 1 + Math.log(1 + doc.length); // dampen long documents
+    const ageDays = doc.dateMs > 0 ? Math.max(0, (now - doc.dateMs) / DAY_MS) : Infinity;
+    const recency = 1 + RECENCY_WEIGHT * Math.exp(-ageDays / RECENCY_HALFLIFE_DAYS);
+    score *= recency;
+    if (score <= 0) continue;
+
+    const { body } = splitFrontMatter(doc.raw);
+    results.push({
+      file: doc.file,
+      scope,
+      title: titleOf(doc.raw, doc.filename),
+      excerpt: makeExcerpt(body, terms),
+      score,
+    });
   }
   return results;
 }
@@ -179,6 +261,11 @@ export function searchFiles(
     .slice(0, 10);
 }
 
+/** Cache root for a pulled remote repo — a project-root-shaped dir under .repomem/.cache/. */
+export function remoteCacheRoot(projectRoot: string, r: RemoteRef): string {
+  return path.join(getRepomemRoot(projectRoot), ".cache", remoteSlug(r));
+}
+
 export function searchAllRepos(
   query: string,
   projectRoot: string = findProjectRoot(),
@@ -188,6 +275,15 @@ export function searchAllRepos(
   all.push(...searchInRoot(query, "[current]", projectRoot));
 
   for (const link of config.linked) {
+    const remote = parseRemote(link.repo);
+    if (remote) {
+      // Remote repo: search the local cache populated by `repomem pull`.
+      const cacheRoot = remoteCacheRoot(projectRoot, remote);
+      if (isInitialized(cacheRoot)) {
+        all.push(...searchInRoot(query, `[remote:${remote.name}]`, cacheRoot));
+      }
+      continue;
+    }
     const linkedRoot = path.resolve(projectRoot, link.repo);
     if (isInitialized(linkedRoot)) {
       const name = path.basename(linkedRoot);
@@ -203,6 +299,45 @@ export function searchAllRepos(
   }
 
   return all.sort((a, b) => b.score - a.score).slice(0, 10);
+}
+
+const SECTION_RE = /^###\s+(decisions|sessions|patterns|issues)\/(.+\.md)\s*$/;
+
+/**
+ * Parse a `repomem sync` export bundle and write its files back into .repomem/.
+ * The inverse of the CLI's export format — used for airgapped transfer. Returns
+ * the list of `type/filename` entries written. Existing files are overwritten.
+ */
+export function importBundle(
+  text: string,
+  projectRoot: string = findProjectRoot()
+): string[] {
+  const lines = text.split(/\r?\n/);
+  const written: string[] = [];
+  let current: { type: MemoryType; filename: string; body: string[] } | null = null;
+
+  const flush = () => {
+    if (!current) return;
+    const content =
+      current.body.join("\n").replace(/^(?:[ \t]*\n)+/, "").replace(/\s*$/, "") + "\n";
+    writeFile(current.type, current.filename, content, {}, projectRoot);
+    written.push(`${current.type}/${current.filename}`);
+    current = null;
+  };
+
+  for (const line of lines) {
+    const m = line.match(SECTION_RE);
+    if (m) {
+      flush();
+      current = { type: m[1] as MemoryType, filename: m[2].trim(), body: [] };
+      continue;
+    }
+    // Skip the bundle title and per-type headers when between sections.
+    if (!current && (line.startsWith("# ") || line.startsWith("## "))) continue;
+    if (current) current.body.push(line);
+  }
+  flush();
+  return written;
 }
 
 /** Counts of each memory type — used by `status` and the index. */

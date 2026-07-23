@@ -102,18 +102,25 @@ Working across microservices or a multi-repo setup? repomem handles it.
   "project": "payments-service",
   "workspace": "../repomem-workspace",
   "linked": [
-    { "repo": "../auth-service",  "relation": "depends-on" },
-    { "repo": "../shared-lib",    "relation": "consumes"   }
+    { "repo": "../auth-service",          "relation": "depends-on" },
+    { "repo": "../shared-lib",            "relation": "consumes"   },
+    { "repo": "github:acme/billing-svc",  "relation": "depends-on" }
   ]
 }
 ```
 
-When your agent calls `mem_search`, repomem searches:
+Linked repos can be **local paths** or **remote GitHub repos** (`github:owner/name`,
+optionally `#ref`). For remotes, run `repomem pull` once to fetch their `.repomem/`
+into a local, gitignored cache — no full clone needed. A `GITHUB_TOKEN`/`GH_TOKEN`
+env var is used for private repos and higher rate limits.
+
+When your agent calls `mem_search` with `linked=true`, repomem searches:
 1. Current repo memory
-2. Linked repo memory (contracts, shared patterns)
+2. Linked repo memory — local paths and pulled remotes (contracts, shared patterns)
 3. Workspace memory (org-wide decisions)
 
-Results are ranked and labelled by source: `[payments] [auth] [workspace]`
+Results are ranked (TF-IDF + recency) and labelled by source:
+`[current] [linked:auth-service] [remote:billing-svc] [workspace]`
 
 Cross-repository context that actually travels with the code — not locked in a personal tool on one machine.
 
@@ -144,17 +151,19 @@ Cross-repository context that actually travels with the code — not locked in a
 - [x] Multi-repo `linked` support (local paths)
 - [x] Workspace scope (cross-org shared memory repo)
 - [x] `repomem sync` — export `.repomem/` to stdout for sharing
-- [ ] Remote linked repos (read `.repomem/` from GitHub without cloning)
-- [ ] `repomem sync` import side for airgapped environments
-- [ ] Smarter search ranking (recency + TF-IDF weighting)
+- [x] Remote linked repos (read `.repomem/` from GitHub without cloning, via `repomem pull`)
+- [x] `repomem import` — import a sync bundle for airgapped environments
+- [x] Smarter search ranking (recency + TF-IDF weighting)
 
 ---
 
 ## Status
 
-**v0.1 — working.** `init`, `setup`, `status`, `sync`, and all four MCP tools
-(`mem_save`, `mem_search`, `mem_context`, `mem_handoff`) are implemented and tested.
-Local multi-repo `linked` + `workspace` search works. Remote linked repos are next.
+**v0.1 — working.** `init`, `setup`, `status`, `sync`, `import`, `pull`, and all
+four MCP tools (`mem_save`, `mem_search`, `mem_context`, `mem_handoff`) are
+implemented and tested. Multi-repo search spans local `linked` paths, remote
+GitHub repos (pulled into a local cache), and a shared `workspace`. Search is
+ranked by TF-IDF with a recency boost.
 
 If this solves a problem you have, **star the repo** — it helps validate that this is worth building and tells me which features to prioritise first.
 

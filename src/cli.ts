@@ -13,20 +13,34 @@ import {
   MEMORY_TYPES,
   counts,
   generateIndex,
+  importBundle,
   isInitialized,
   listFiles,
   readFile,
+  remoteCacheRoot,
+  REPOMEM_DIR,
 } from "./store/file-store.js";
+import { parseRemote, fetchRemoteRepomem, RemoteRef } from "./store/remote.js";
 
-const AGENTS: Record<string, { file: string; label: string }> = {
-  "claude-code": { file: ".claude/mcp.json", label: "Claude Code" },
-  cursor: { file: ".cursor/mcp.json", label: "Cursor" },
-  gemini: { file: ".gemini/settings.json", label: "Gemini CLI" },
-  "gemini-cli": { file: ".gemini/settings.json", label: "Gemini CLI" },
-  codex: { file: ".codex/config.json", label: "Codex" },
+interface AgentSpec {
+  file: string;
+  label: string;
+  format: "json" | "toml";
+}
+
+// Each agent reads project-scoped MCP config from a specific file at the repo
+// root. Claude Code uses `.mcp.json` (NOT `.claude/mcp.json`); Codex uses TOML.
+const AGENTS: Record<string, AgentSpec> = {
+  "claude-code": { file: ".mcp.json", label: "Claude Code", format: "json" },
+  cursor: { file: ".cursor/mcp.json", label: "Cursor", format: "json" },
+  gemini: { file: ".gemini/settings.json", label: "Gemini CLI", format: "json" },
+  "gemini-cli": { file: ".gemini/settings.json", label: "Gemini CLI", format: "json" },
+  codex: { file: ".codex/config.toml", label: "Codex", format: "toml" },
 };
 
-const MCP_ENTRY = { command: "npx", args: ["@saleem11kh/repomem"] };
+const MCP_COMMAND = "npx";
+const MCP_ARGS = ["@saleem11kh/repomem"];
+const MCP_ENTRY = { command: MCP_COMMAND, args: MCP_ARGS };
 
 function cwd(): string {
   return process.cwd();
@@ -82,8 +96,24 @@ function cmdSetup(agentArg?: string): void {
 
   const root = cwd();
   const target = path.join(root, agent.file);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const dir = path.dirname(target);
+  if (dir !== root) fs.mkdirSync(dir, { recursive: true });
 
+  const wired = agent.format === "toml"
+    ? setupToml(target, agent)
+    : setupJson(target, agent);
+  if (!wired) return;
+
+  console.log(`✔ Wired repomem into ${agent.label} (${agent.file})`);
+  if (agent.format === "toml") {
+    console.log("  Codex only loads project config for trusted projects —");
+    console.log("  run it from this dir and approve the trust prompt.");
+  }
+  console.log("  Restart the agent to pick up the new MCP server.");
+}
+
+/** Merge the repomem entry into a JSON `mcpServers` map. Returns false on error. */
+function setupJson(target: string, agent: AgentSpec): boolean {
   let existing: Record<string, unknown> = {};
   if (fs.existsSync(target)) {
     try {
@@ -91,7 +121,7 @@ function cmdSetup(agentArg?: string): void {
     } catch {
       console.error(`✖ ${agent.file} exists but is not valid JSON — aborting.`);
       process.exitCode = 1;
-      return;
+      return false;
     }
   }
 
@@ -101,8 +131,25 @@ function cmdSetup(agentArg?: string): void {
   existing.mcpServers = servers;
 
   fs.writeFileSync(target, JSON.stringify(existing, null, 2) + "\n", "utf8");
-  console.log(`✔ Wired repomem into ${agent.label} (${agent.file})`);
-  console.log("  Restart the agent to pick up the new MCP server.");
+  return true;
+}
+
+/** Append a `[mcp_servers.repomem]` block to a Codex TOML config (idempotent). */
+function setupToml(target: string, agent: AgentSpec): boolean {
+  const content = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : "";
+  if (/^\s*\[mcp_servers\.repomem\]/m.test(content)) {
+    console.log(`• repomem already configured in ${agent.label} (${agent.file})`);
+    return false;
+  }
+  const block = [
+    "[mcp_servers.repomem]",
+    `command = ${JSON.stringify(MCP_COMMAND)}`,
+    `args = [${MCP_ARGS.map((a) => JSON.stringify(a)).join(", ")}]`,
+    "",
+  ].join("\n");
+  const prefix = content.trim() ? content.replace(/\s*$/, "") + "\n\n" : "";
+  fs.writeFileSync(target, prefix + block, "utf8");
+  return true;
 }
 
 /** repomem status — print a health summary. */
@@ -158,6 +205,90 @@ function cmdSync(): void {
   process.stdout.write(out.join("\n") + "\n");
 }
 
+/** Ensure the remote cache is gitignored so it never gets committed. */
+function ensureCacheGitignore(root: string): void {
+  const cacheDir = path.join(getRepomemRoot(root), ".cache");
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const gi = path.join(cacheDir, ".gitignore");
+  if (!fs.existsSync(gi)) {
+    fs.writeFileSync(gi, "# repomem remote cache — fetched copies, do not commit\n*\n", "utf8");
+  }
+}
+
+/** repomem pull — fetch remote linked repos' .repomem/ into the local cache. */
+async function cmdPull(): Promise<void> {
+  const root = cwd();
+  if (!isInitialized(root)) {
+    console.error("✖ .repomem/ not found here. Run `repomem init` first.");
+    process.exitCode = 1;
+    return;
+  }
+  const config = loadConfig(root);
+  const remotes = config.linked
+    .map((l) => parseRemote(l.repo))
+    .filter((r): r is RemoteRef => r !== null);
+
+  if (remotes.length === 0) {
+    console.log("• No remote linked repos to pull.");
+    console.log('  Add one to repomem.config.json, e.g. { "repo": "github:owner/name" }');
+    return;
+  }
+
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+  ensureCacheGitignore(root);
+
+  for (const r of remotes) {
+    const destRepomem = path.join(remoteCacheRoot(root, r), REPOMEM_DIR);
+    try {
+      fs.mkdirSync(destRepomem, { recursive: true });
+      const count = await fetchRemoteRepomem(r, destRepomem, token);
+      console.log(`✔ Pulled ${count} file(s) from ${r.owner}/${r.name}@${r.ref}`);
+    } catch (err) {
+      console.error(`✖ ${r.owner}/${r.name}: ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1;
+    }
+  }
+  console.log("\nRemote memory is now searchable — mem_search with linked=true.");
+}
+
+/** repomem import [file] — write a `repomem sync` bundle back into .repomem/. */
+function cmdImport(fileArg?: string): void {
+  const root = cwd();
+  if (!isInitialized(root)) {
+    console.error("✖ .repomem/ not found here. Run `repomem init` first.");
+    process.exitCode = 1;
+    return;
+  }
+
+  let text: string;
+  if (fileArg) {
+    try {
+      text = fs.readFileSync(path.resolve(root, fileArg), "utf8");
+    } catch {
+      console.error(`✖ Cannot read ${fileArg}`);
+      process.exitCode = 1;
+      return;
+    }
+  } else {
+    try {
+      text = fs.readFileSync(0, "utf8"); // stdin
+    } catch {
+      console.error("✖ Provide a file: `repomem import bundle.md`, or pipe via stdin.");
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  const written = importBundle(text, root);
+  if (written.length === 0) {
+    console.log("• Nothing to import — no recognised memory sections found.");
+    return;
+  }
+  generateIndex(root);
+  console.log(`✔ Imported ${written.length} file(s):`);
+  for (const f of written) console.log(`  ${f}`);
+}
+
 function cmdHelp(): void {
   console.log(`repomem — git-native memory for AI coding agents
 
@@ -168,6 +299,8 @@ Usage:
                                (${Object.keys(AGENTS).join(", ")})
   repomem status               Show memory counts and configured agents
   repomem sync                 Export all memory to stdout
+  repomem import [file]        Import a sync bundle (file or stdin) into .repomem/
+  repomem pull                 Fetch remote linked repos' memory from GitHub
   repomem help                 Show this help`);
 }
 
@@ -190,6 +323,12 @@ async function main(): Promise<void> {
       return;
     case "sync":
       cmdSync();
+      return;
+    case "pull":
+      await cmdPull();
+      return;
+    case "import":
+      cmdImport(arg);
       return;
     case "help":
     case "--help":
