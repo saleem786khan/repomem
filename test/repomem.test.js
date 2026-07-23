@@ -18,6 +18,8 @@ const { memSave } = require("../dist/tools/mem-save.js");
 const { memSearch } = require("../dist/tools/mem-search.js");
 const { memContext } = require("../dist/tools/mem-context.js");
 const { memHandoff } = require("../dist/tools/mem-handoff.js");
+const { memGet } = require("../dist/tools/mem-get.js");
+const { memPrime } = require("../dist/tools/mem-prime.js");
 
 /** Make an isolated, initialised project root in a temp dir. */
 function makeProject(name) {
@@ -408,4 +410,108 @@ test("fetchRemoteRepomem writes .repomem/ md files from the GitHub API", async (
   } finally {
     global.fetch = savedFetch;
   }
+});
+
+// ---------------------------------------------------------------------------
+// summaries, mem_get, wikilink graph, mem_prime
+// ---------------------------------------------------------------------------
+test("mem_save writes a summary front-matter field and renders links as [[wikilinks]]", () => {
+  const root = makeProject();
+  memSave.handler(
+    {
+      type: "pattern",
+      title: "Funnel IO",
+      content: "All disk access via file-store.",
+      summary: "Centralize filesystem access in one module.",
+      links: ["Use Postgres for ledger"],
+    },
+    root
+  );
+  const raw = store.readFile("patterns", store.listFiles("patterns", root)[0], root);
+  assert.match(raw, /summary: Centralize filesystem access in one module\./);
+  assert.match(raw, /\[\[use-postgres-for-ledger\]\]/, "links become slugged wikilinks");
+});
+
+test("summaryOf prefers front matter, else first prose line", () => {
+  assert.equal(
+    store.summaryOf("---\nsummary: Explicit one.\n---\n# T\nbody text", "x.md"),
+    "Explicit one."
+  );
+  assert.equal(store.summaryOf("# Title\nFirst prose line here.", "x.md"), "First prose line here.");
+});
+
+test("mem_context returns one-line summaries, not full bodies (token-lean)", () => {
+  const root = makeProject("@acme/widget");
+  memSave.handler(
+    { type: "pattern", title: "Repo pattern", content: "LONG_BODY_MARKER should not appear", summary: "short summary" },
+    root
+  );
+  const full = memContext.handler({}, root);
+  assert.match(full, /## Patterns/);
+  assert.match(full, /Repo pattern — short summary/);
+  assert.ok(!full.includes("LONG_BODY_MARKER"), "full body must not be inlined");
+  assert.match(full, /mem_get/, "points at mem_get to expand");
+});
+
+test("mem_get resolves by type/filename and by [[wikilink]] slug, listing related", () => {
+  const root = makeProject();
+  memSave.handler({ type: "decision", title: "Use Postgres for ledger", content: "ACID." }, root);
+  memSave.handler(
+    { type: "pattern", title: "Funnel IO", content: "via store", links: ["use-postgres-for-ledger"] },
+    root
+  );
+  const dfile = store.listFiles("decisions", root)[0];
+
+  const byPath = memGet.handler({ file: `decisions/${dfile}` }, root);
+  assert.match(byPath, /# Use Postgres for ledger/);
+
+  const bySlug = memGet.handler({ file: "funnel-io" }, root);
+  assert.match(bySlug, /# Funnel IO/);
+  assert.match(bySlug, /Related entries/);
+  assert.match(bySlug, /Use Postgres for ledger/);
+
+  assert.match(memGet.handler({ file: "nope-xyz" }, root), /No memory entry matches/);
+});
+
+test("wikilink resolveLink and relatedOf traverse links", () => {
+  const root = makeProject();
+  memSave.handler({ type: "decision", title: "Use Postgres for ledger", content: "ACID." }, root);
+  const hit = store.resolveLink("use-postgres-for-ledger", root);
+  assert.equal(hit.type, "decisions");
+  assert.match(hit.title, /Use Postgres for ledger/);
+  const related = store.relatedOf("see [[use-postgres-for-ledger]]", root);
+  assert.equal(related.length, 1);
+});
+
+test("mem_search surfaces related wikilinks", () => {
+  const root = makeProject();
+  memSave.handler({ type: "decision", title: "Use Postgres for ledger", content: "ACID." }, root);
+  memSave.handler(
+    { type: "pattern", title: "Funnel IO", content: "route disk access via store", links: ["use-postgres-for-ledger"] },
+    root
+  );
+  const out = memSearch.handler({ query: "disk access" }, root);
+  assert.match(out, /→ related: Use Postgres for ledger/);
+});
+
+test("mem_prime bundles existing project docs with instructions", () => {
+  const root = makeProject();
+  fs.writeFileSync(path.join(root, "CLAUDE.md"), "# Demo\nUse Postgres for the ledger.\n");
+  const out = memPrime.handler({}, root);
+  assert.match(out, /priming packet/);
+  assert.match(out, /## Sources/);
+  assert.match(out, /CLAUDE\.md/);
+  assert.match(out, /Use Postgres for the ledger/);
+});
+
+test("mem_prime reports when there is nothing to prime from", () => {
+  const root = makeProject();
+  const out = memPrime.handler({}, root);
+  assert.match(out, /No source docs found/);
+});
+
+test("mem_get and mem_prime guard an uninitialised project", () => {
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), "repomem-bare-"));
+  assert.match(memGet.handler({ file: "x" }, bare), /repomem init/);
+  assert.match(memPrime.handler({}, bare), /repomem init/);
 });

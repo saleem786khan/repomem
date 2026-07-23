@@ -54,10 +54,12 @@ repomem runs as an MCP server. Your AI agent gets 4 tools:
 
 | Tool | What it does |
 |---|---|
-| `mem_save` | Save a decision, pattern, issue, or session note |
-| `mem_search` | Search across all memory files instantly |
-| `mem_context` | Get a context packet at session start — no re-explaining |
+| `mem_save` | Save a decision, pattern, issue, or session note (with a one-line summary + `[[links]]`) |
+| `mem_search` | Search across all memory files instantly (BM25 + recency ranked) |
+| `mem_context` | Get a lean context packet at session start — summaries, not full bodies |
+| `mem_get` | Expand a single entry (by file or `[[wikilink]]`) only when you need it |
 | `mem_handoff` | Write today's session file, ready to commit |
+| `mem_prime` | Bootstrap memory on an existing repo from its CLAUDE.md / docs |
 
 At the start of every session, your agent calls `mem_context()` and immediately knows:
 - What was worked on last session
@@ -65,6 +67,11 @@ At the start of every session, your agent calls `mem_context()` and immediately 
 - Patterns and conventions for this specific codebase
 - Known issues to avoid repeating
 - What's next
+
+To keep context small, `mem_context` returns **one-line summaries**; the agent expands
+only what it needs with `mem_get`. Entries can cross-link with `[[wikilinks]]`, so related
+decisions, patterns, and issues travel together. Already have a context-rich repo? Run
+`mem_prime` once to seed memory from your existing `CLAUDE.md` and `docs/`.
 
 ---
 
@@ -153,17 +160,23 @@ Cross-repository context that actually travels with the code — not locked in a
 - [x] `repomem sync` — export `.repomem/` to stdout for sharing
 - [x] Remote linked repos (read `.repomem/` from GitHub without cloning, via `repomem pull`)
 - [x] `repomem import` — import a sync bundle for airgapped environments
-- [x] Smarter search ranking (recency + TF-IDF weighting)
+- [x] Smarter search ranking (BM25 + recency weighting)
+- [x] Progressive disclosure — `mem_context` summaries + `mem_get` to expand
+- [x] `[[wikilink]]` graph between memories (traversed by search + context)
+- [x] `mem_prime` — bootstrap memory from an existing repo's docs
+- [ ] Optional semantic search layer (off by default, local embedding cache)
 
 ---
 
 ## Status
 
-**v0.1 — working.** `init`, `setup`, `status`, `sync`, `import`, `pull`, and all
-four MCP tools (`mem_save`, `mem_search`, `mem_context`, `mem_handoff`) are
-implemented and tested. Multi-repo search spans local `linked` paths, remote
-GitHub repos (pulled into a local cache), and a shared `workspace`. Search is
-ranked by TF-IDF with a recency boost.
+**v0.2 — working.** `init`, `setup`, `status`, `sync`, `import`, `pull`, and six
+MCP tools (`mem_save`, `mem_search`, `mem_context`, `mem_get`, `mem_handoff`,
+`mem_prime`) are implemented and tested. Context is token-lean by default
+(summaries + `mem_get` to expand), memories cross-link with `[[wikilinks]]`, and
+`mem_prime` bootstraps an existing repo from its docs. Multi-repo search spans
+local `linked` paths, remote GitHub repos (pulled into a local cache), and a
+shared `workspace`, ranked by BM25 with a recency boost.
 
 If this solves a problem you have, **star the repo** — it helps validate that this is worth building and tells me which features to prioritise first.
 

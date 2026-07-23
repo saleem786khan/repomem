@@ -11,8 +11,17 @@ import { memSave } from "./tools/mem-save.js";
 import { memSearch } from "./tools/mem-search.js";
 import { memContext } from "./tools/mem-context.js";
 import { memHandoff } from "./tools/mem-handoff.js";
+import { memGet } from "./tools/mem-get.js";
+import { memPrime } from "./tools/mem-prime.js";
 
-const TOOLS: ToolDef[] = [memSave, memSearch, memContext, memHandoff];
+const TOOLS: ToolDef[] = [
+  memSave,
+  memSearch,
+  memContext,
+  memHandoff,
+  memGet,
+  memPrime,
+];
 const TOOL_MAP = new Map(TOOLS.map((t) => [t.name, t]));
 
 const VERSION = "0.2.0";
@@ -26,8 +35,10 @@ export async function startServer(): Promise<void> {
       instructions:
         "Git-native memory for AI coding agents. Memory lives in .repomem/ in the " +
         "repo, commits with the code, and travels to teammates. Call mem_context at " +
-        "the start of a session, mem_save to capture decisions/patterns/issues, " +
-        "mem_search to recall, and mem_handoff to close out a session.",
+        "the start of a session (it returns summaries — expand any entry with " +
+        "mem_get), mem_save to capture decisions/patterns/issues, mem_search to " +
+        "recall, and mem_handoff to close out a session. On a project new to " +
+        "repomem, call mem_prime once to bootstrap memory from existing docs.",
     }
   );
 

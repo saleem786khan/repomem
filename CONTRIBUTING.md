@@ -26,7 +26,7 @@ src/
   config/config.ts  loads repomem.config.json, finds the project root
   store/file-store.ts  local disk store: read/write/search/index + import
   store/remote.ts   remote linked repos: parse github specs, fetch .repomem/ from the GitHub API
-  tools/            the 4 MCP tools (mem_save, mem_search, mem_context, mem_handoff)
+  tools/            the 6 MCP tools (mem_save, mem_search, mem_context, mem_get, mem_handoff, mem_prime)
 test/               node:test suite, run against the compiled dist/
 ```
 

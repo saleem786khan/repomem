@@ -34,10 +34,23 @@ export const memSave: ToolDef = {
       },
       title: { type: "string", description: "Short title for this memory." },
       content: { type: "string", description: "The memory body, in markdown." },
+      summary: {
+        type: "string",
+        description:
+          "Optional one-line summary. Surfaced by mem_context/mem_search so agents " +
+          "can scan without loading the full body. Auto-derived when omitted.",
+      },
       tags: {
         type: "array",
         items: { type: "string" },
         description: "Optional tags for retrieval.",
+      },
+      links: {
+        type: "array",
+        items: { type: "string" },
+        description:
+          "Optional slugs of related memories to link (e.g. 'use-postgres'). " +
+          "Renders as [[wikilinks]] so context can traverse related entries.",
       },
       supersedes: {
         type: "string",
@@ -65,6 +78,11 @@ export const memSave: ToolDef = {
 
     const tags = strArray(args.tags);
     const supersedes = str(args.supersedes);
+    const summary = str(args.summary);
+    const links = strArray(args.links);
+    const linkLine = links.length
+      ? `\nRelated: ${links.map((l) => `[[${slugify(l)}]]`).join(" ")}\n`
+      : "";
 
     // Sessions are date-keyed and appended to across a single day.
     if (type === "sessions") {
@@ -72,7 +90,7 @@ export const memSave: ToolDef = {
       const block =
         `\n## ${timestamp()} — ${title}\n\n` +
         (tags.length ? `_tags: ${tags.join(", ")}_\n\n` : "") +
-        `${content}\n`;
+        `${content}\n${linkLine}`;
       writeFile(type, filename, block, { append: true }, projectRoot);
       generateIndex(projectRoot);
       return `✔ Appended to sessions/${filename}\n\nRemember to: git add .repomem/ && git commit`;
@@ -80,11 +98,12 @@ export const memSave: ToolDef = {
 
     const filename = `${today()}-${slugify(title)}.md`;
     const fm: string[] = ["---", `date: ${today()}`];
+    if (summary) fm.push(`summary: ${summary.replace(/\n+/g, " ").trim()}`);
     if (tags.length) fm.push(`tags: [${tags.join(", ")}]`);
     if (supersedes) fm.push(`supersedes: ${supersedes}`);
     fm.push("---", "");
 
-    const body = `# ${title}\n\n${content}\n`;
+    const body = `# ${title}\n\n${content}\n${linkLine}`;
     writeFile(type, filename, fm.join("\n") + body, {}, projectRoot);
     generateIndex(projectRoot);
 

@@ -40,8 +40,10 @@ export const memSearch: ToolDef = {
     for (const r of results) {
       lines.push(`${r.scope} ${r.title}  ·  ${r.file}`);
       lines.push(`   ${r.excerpt}`);
+      if (r.related.length) lines.push(`   → related: ${r.related.join(", ")}`);
       lines.push("");
     }
+    lines.push('_Expand any entry with mem_get("type/filename")._');
     return lines.join("\n").trimEnd();
   },
 };

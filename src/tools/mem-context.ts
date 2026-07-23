@@ -3,6 +3,7 @@ import {
   readFile,
   counts,
   isInitialized,
+  summaryOf,
   MemoryType,
 } from "../store/file-store.js";
 import { loadConfig } from "../config/config.js";
@@ -69,47 +70,37 @@ export const memContext: ToolDef = {
       );
     }
 
+    // Full packet, but token-lean: the latest session is inlined (it holds the
+    // "what's next"); everything else is a one-line summary the agent can expand
+    // on demand with mem_get. This keeps session-start context small.
     const out: string[] = [];
     out.push(`# Context for ${config.project}`, "");
 
-    // Latest session.
+    // Latest session — inlined in full.
     const session = readNewest("sessions", projectRoot, 1)[0];
     out.push("## Last session");
     out.push(session ? `### ${session.filename}\n\n${body(session.raw)}` : "_none yet_");
     out.push("");
 
-    // Recent decisions (max 5).
-    out.push("## Recent decisions");
-    const decisions = readNewest("decisions", projectRoot, 5);
-    if (decisions.length === 0) out.push("_none yet_");
-    for (const d of decisions) {
-      out.push(`### ${firstHeading(d.raw, d.filename)}  (${d.filename})`);
-      out.push(body(d.raw));
+    const summaryList = (type: MemoryType, heading: string, limit: number) => {
+      out.push(`## ${heading}`);
+      const entries = readNewest(type, projectRoot, limit);
+      if (entries.length === 0) out.push("_none yet_");
+      for (const e of entries) {
+        out.push(`- ${firstHeading(e.raw, e.filename)} — ${summaryOf(e.raw, e.filename)}  (${type}/${e.filename})`);
+      }
       out.push("");
-    }
+    };
 
-    // All patterns.
-    out.push("## Patterns");
-    const patterns = readNewest("patterns", projectRoot, 100);
-    if (patterns.length === 0) out.push("_none yet_");
-    for (const p of patterns) {
-      out.push(`### ${firstHeading(p.raw, p.filename)}`);
-      out.push(body(p.raw));
-      out.push("");
-    }
+    summaryList("decisions", "Recent decisions", 5);
+    summaryList("patterns", "Patterns", 100);
+    summaryList("issues", "Known issues", 100);
 
-    // Open issues.
-    out.push("## Known issues");
-    const issues = readNewest("issues", projectRoot, 100);
-    if (issues.length === 0) out.push("_none yet_");
-    for (const i of issues) {
-      out.push(`### ${firstHeading(i.raw, i.filename)}`);
-      out.push(body(i.raw));
-      out.push("");
-    }
+    out.push("_Expand any entry with mem_get(\"type/filename\"). Search with mem_search._");
 
     // Workspace pointer.
     if (config.workspace || config.linked.length) {
+      out.push("");
       out.push("## Linked context");
       if (config.workspace) out.push(`- workspace: ${config.workspace}`);
       for (const l of config.linked) {

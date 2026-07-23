@@ -21,6 +21,7 @@ export interface SearchResult {
   title: string;
   excerpt: string;
   score: number;
+  related: string[]; // titles of [[wikilinked]] entries
 }
 
 /** Absolute path to the .repomem/ dir for a given project root. */
@@ -107,12 +108,163 @@ function titleOf(raw: string, filename: string): string {
   return m ? m[1].trim() : filename.replace(/\.md$/, "");
 }
 
+/** Return the raw YAML front-matter block (between the --- fences), or "". */
+function frontMatter(raw: string): string {
+  if (raw.startsWith("---")) {
+    const end = raw.indexOf("\n---", 3);
+    if (end !== -1) return raw.slice(3, end);
+  }
+  return "";
+}
+
+/** Read a single scalar front-matter field, or null. */
+function fmField(raw: string, key: string): string | null {
+  const m = frontMatter(raw).match(new RegExp(`^\\s*${key}:\\s*(.+)$`, "m"));
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * A one-line summary for an entry: the `summary:` front-matter field, else the
+ * first prose line of the body, else the title. Used by mem_context and
+ * mem_search to surface entries cheaply (progressive disclosure).
+ */
+export function summaryOf(raw: string, filename: string): string {
+  const explicit = fmField(raw, "summary");
+  if (explicit) return explicit.replace(/^["']|["']$/g, "");
+  const { body } = splitFrontMatter(raw);
+  const line = body
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l.length > 0 && !l.startsWith("#"));
+  const base = line || titleOf(raw, filename);
+  return base.length > 140 ? base.slice(0, 137).trimEnd() + "…" : base;
+}
+
+/** Extract `[[wikilink]]` targets from a memory's raw text (order-preserving, deduped). */
+export function parseLinks(raw: string): string[] {
+  const out = new Set<string>();
+  const re = /\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw)) !== null) out.add(m[1].trim());
+  return [...out];
+}
+
+/** Strip the date prefix and extension from a memory filename to get its slug. */
+function fileSlug(filename: string): string {
+  return filename.replace(/\.md$/i, "").replace(/^\d{4}-\d{2}-\d{2}-?/, "").toLowerCase();
+}
+
+export interface ResolvedLink {
+  type: MemoryType;
+  filename: string;
+  title: string;
+}
+
+/**
+ * Resolve a `[[target]]` to a memory file. Matches an exact filename, an exact
+ * slug (date-stripped), or a unique slug substring. Returns null when unresolved.
+ */
+export function resolveLink(
+  target: string,
+  projectRoot: string = findProjectRoot()
+): ResolvedLink | null {
+  const t = target.replace(/\.md$/i, "").toLowerCase().trim();
+  let partial: ResolvedLink | null = null;
+  let partialCount = 0;
+  for (const type of MEMORY_TYPES) {
+    for (const filename of listFiles(type, projectRoot)) {
+      const nameNoExt = filename.replace(/\.md$/i, "").toLowerCase();
+      const slug = fileSlug(filename);
+      if (nameNoExt === t || slug === t) {
+        const raw = readFile(type, filename, projectRoot) ?? "";
+        return { type, filename, title: titleOf(raw, filename) };
+      }
+      if (slug.includes(t) || nameNoExt.includes(t)) {
+        const raw = readFile(type, filename, projectRoot) ?? "";
+        partial = { type, filename, title: titleOf(raw, filename) };
+        partialCount++;
+      }
+    }
+  }
+  return partialCount === 1 ? partial : null;
+}
+
+/** Resolve all `[[wikilinks]]` in a file to their target entries (unresolved dropped). */
+export function relatedOf(
+  raw: string,
+  projectRoot: string = findProjectRoot()
+): ResolvedLink[] {
+  const out: ResolvedLink[] = [];
+  const seen = new Set<string>();
+  for (const target of parseLinks(raw)) {
+    const hit = resolveLink(target, projectRoot);
+    if (hit && !seen.has(hit.filename)) {
+      seen.add(hit.filename);
+      out.push(hit);
+    }
+  }
+  return out;
+}
+
+/**
+ * Gather existing project docs (CLAUDE.md, AGENTS.md, README, docs/**.md) so an
+ * agent can bootstrap memory for a project that already has lots of context.
+ * Each doc is capped to keep the priming payload bounded.
+ */
+export function readProjectDocs(
+  projectRoot: string = findProjectRoot(),
+  perFileCap = 6000,
+  maxFiles = 12
+): { rel: string; text: string }[] {
+  const found: { rel: string; text: string }[] = [];
+  const push = (abs: string) => {
+    try {
+      const text = fs.readFileSync(abs, "utf8");
+      if (text.trim()) {
+        found.push({ rel: path.relative(projectRoot, abs), text: text.slice(0, perFileCap) });
+      }
+    } catch {
+      /* skip unreadable */
+    }
+  };
+
+  for (const name of ["CLAUDE.md", "AGENTS.md", "GEMINI.md", "README.md"]) {
+    const abs = path.join(projectRoot, name);
+    if (fs.existsSync(abs)) push(abs);
+  }
+
+  // Shallow-ish walk of docs/ for markdown (ADRs, design notes).
+  const docsDir = path.join(projectRoot, "docs");
+  const walk = (dir: string, depth: number) => {
+    if (depth > 2 || found.length >= maxFiles) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (found.length >= maxFiles) return;
+      const abs = path.join(dir, e.name);
+      if (e.isDirectory()) walk(abs, depth + 1);
+      else if (e.isFile() && e.name.toLowerCase().endsWith(".md")) push(abs);
+    }
+  };
+  if (fs.existsSync(docsDir)) walk(docsDir, 0);
+
+  return found.slice(0, maxFiles);
+}
+
 // Recency boost: a fresh doc can score up to (1 + RECENCY_WEIGHT)× a stale one,
 // decaying with a ~RECENCY_HALFLIFE_DAYS half-life. Keeps yesterday's session
 // ahead of a year-old note when both match equally well.
 const RECENCY_WEIGHT = 0.5;
 const RECENCY_HALFLIFE_DAYS = 30;
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+// BM25 tuning: k1 controls term-frequency saturation, b the length penalty.
+const BM25_K1 = 1.5;
+const BM25_B = 0.75;
 
 interface Doc {
   file: string;
@@ -205,17 +357,19 @@ function searchInRoot(
   const n = docs.length;
   const now = Date.now();
 
-  // Pass 3: score = Σ (sublinear-tf × idf), length-normalised, × recency boost.
-  // Sublinear tf (1 + ln tf) stops a doc that merely repeats a common term from
-  // outranking one that actually contains the rare, discriminating term.
+  // Pass 3: BM25 relevance × recency boost. BM25's saturating tf (k1) and length
+  // normalisation (b) keep a doc that merely repeats a common term from
+  // outranking one containing the rare, discriminating term.
+  const avgdl = docs.reduce((s, d) => s + d.length, 0) / docs.length;
   const results: SearchResult[] = [];
   for (const doc of docs) {
     let score = 0;
     for (const [term, tf] of doc.counts) {
-      const idf = Math.log(1 + n / (1 + (df.get(term) ?? 0)));
-      score += (1 + Math.log(tf)) * idf;
+      const dfv = df.get(term) ?? 0;
+      const idf = Math.log(1 + (n - dfv + 0.5) / (dfv + 0.5));
+      const denom = tf + BM25_K1 * (1 - BM25_B + (BM25_B * doc.length) / avgdl);
+      score += idf * ((tf * (BM25_K1 + 1)) / denom);
     }
-    score /= 1 + Math.log(1 + doc.length); // dampen long documents
     const ageDays = doc.dateMs > 0 ? Math.max(0, (now - doc.dateMs) / DAY_MS) : Infinity;
     const recency = 1 + RECENCY_WEIGHT * Math.exp(-ageDays / RECENCY_HALFLIFE_DAYS);
     score *= recency;
@@ -228,6 +382,7 @@ function searchInRoot(
       title: titleOf(doc.raw, doc.filename),
       excerpt: makeExcerpt(body, terms),
       score,
+      related: relatedOf(doc.raw, projectRoot).map((r) => r.title),
     });
   }
   return results;
