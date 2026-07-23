@@ -259,6 +259,16 @@ function runCli(root, ...args) {
   return execFileSync(process.execPath, [CLI, ...args], { cwd: root, encoding: "utf8" });
 }
 
+/** Run the CLI without throwing; return { code, out } where out = stdout+stderr. */
+function cliResult(root, ...args) {
+  try {
+    const out = execFileSync(process.execPath, [CLI, ...args], { cwd: root, encoding: "utf8" });
+    return { code: 0, out };
+  } catch (e) {
+    return { code: e.status ?? 1, out: (e.stdout || "") + (e.stderr || "") };
+  }
+}
+
 test("cli setup claude-code writes .mcp.json at repo root (not .claude/)", () => {
   const root = makeProject();
   runCli(root, "setup", "claude-code");
@@ -514,4 +524,186 @@ test("mem_get and mem_prime guard an uninitialised project", () => {
   const bare = fs.mkdtempSync(path.join(os.tmpdir(), "repomem-bare-"));
   assert.match(memGet.handler({ file: "x" }, bare), /repomem init/);
   assert.match(memPrime.handler({}, bare), /repomem init/);
+});
+
+// ===========================================================================
+// END-TO-END — drive the real shipped artifacts as subprocesses:
+//   * the MCP server over stdio JSON-RPC (how agents call it)
+//   * the CLI binary (how humans call it)
+// ===========================================================================
+
+/**
+ * Run a full MCP session: initialize, then one tools/call per entry in `calls`.
+ * Returns the text of each tool result, in order. Drives dist/cli.js (no args →
+ * MCP server) exactly as an agent would.
+ */
+function mcp(root, calls) {
+  const requests = [
+    {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "test", version: "1" },
+      },
+    },
+    ...calls.map((c, i) => ({
+      jsonrpc: "2.0",
+      id: i + 2,
+      method: "tools/call",
+      params: { name: c.name, arguments: c.arguments || {} },
+    })),
+  ];
+  const input = requests.map((r) => JSON.stringify(r)).join("\n") + "\n";
+  const out = execFileSync(process.execPath, [CLI], {
+    cwd: root,
+    input,
+    encoding: "utf8",
+    timeout: 20000,
+  });
+  const byId = new Map();
+  for (const line of out.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const j = JSON.parse(line);
+      if (j.id != null) byId.set(j.id, j);
+    } catch {
+      /* non-JSON stray line */
+    }
+  }
+  return calls.map((_, i) => {
+    const resp = byId.get(i + 2);
+    if (!resp) return { text: "", isError: true, missing: true };
+    const text = resp.result?.content?.[0]?.text ?? "";
+    return { text, isError: resp.result?.isError === true };
+  });
+}
+
+function initProject(name) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "repomem-e2e-"));
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: name || "e2e-svc" }));
+  runCli(root, "init");
+  return root;
+}
+
+test("e2e MCP: initialize + tools/list exposes all six tools", () => {
+  const root = initProject();
+  const input =
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "1" } },
+    }) +
+    "\n" +
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) +
+    "\n";
+  const out = execFileSync(process.execPath, [CLI], { cwd: root, input, encoding: "utf8", timeout: 20000 });
+  const listResp = out
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .find((j) => j && j.id === 2);
+  const names = listResp.result.tools.map((t) => t.name).sort();
+  assert.deepEqual(names, ["mem_context", "mem_get", "mem_handoff", "mem_prime", "mem_save", "mem_search"]);
+});
+
+test("e2e MCP: full save → context → search → get → handoff workflow", () => {
+  const root = initProject("@acme/shop");
+  const [save, ctx, search, get, handoff] = mcp(root, [
+    {
+      name: "mem_save",
+      arguments: {
+        type: "decision",
+        title: "Use Postgres for ledger",
+        content: "ACID guarantees for money.",
+        summary: "Postgres over Mongo for the ledger.",
+      },
+    },
+    { name: "mem_context", arguments: {} },
+    { name: "mem_search", arguments: { query: "postgres ledger" } },
+    { name: "mem_get", arguments: { file: "use-postgres-for-ledger" } },
+    { name: "mem_handoff", arguments: { summary: "wired the store", next: ["ship it"] } },
+  ]);
+
+  assert.match(save.text, /Saved decisions\/.*use-postgres-for-ledger\.md/);
+  assert.match(ctx.text, /# Context for shop/);
+  assert.match(ctx.text, /Use Postgres for ledger — Postgres over Mongo/);
+  assert.ok(!ctx.text.includes("ACID guarantees for money"), "context must not inline full body");
+  assert.match(search.text, /Found 1 match/);
+  assert.match(get.text, /ACID guarantees for money/, "mem_get expands the full body");
+  assert.match(handoff.text, /Handoff written to sessions\//);
+
+  // The handoff actually persisted a session file on disk.
+  assert.equal(store.listFiles("sessions", root).length, 1);
+});
+
+test("e2e MCP: unknown tool and uninitialised project are handled, not crashed", () => {
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), "repomem-e2e-bare-"));
+  fs.writeFileSync(path.join(bare, "package.json"), "{}");
+  const [ctx] = mcp(bare, [{ name: "mem_context", arguments: {} }]);
+  assert.match(ctx.text, /repomem init/);
+
+  const root = initProject();
+  const [unknown] = mcp(root, [{ name: "no_such_tool", arguments: {} }]);
+  assert.equal(unknown.isError, true);
+  assert.match(unknown.text, /Unknown tool/);
+});
+
+test("e2e CLI: init → save (via MCP) → status → sync → import round-trips across repos", () => {
+  const a = initProject("@acme/alpha");
+  mcp(a, [
+    { name: "mem_save", arguments: { type: "decision", title: "Pick Redis", content: "cache layer", summary: "Redis for cache" } },
+    { name: "mem_save", arguments: { type: "pattern", title: "Retry with jitter", content: "backoff + jitter" } },
+  ]);
+
+  const status = runCli(a, "status");
+  assert.match(status, /alpha/);
+  assert.match(status, /decisions\s+1/);
+  assert.match(status, /patterns\s+1/);
+
+  const bundle = runCli(a, "sync");
+  assert.match(bundle, /## decisions/);
+  assert.match(bundle, /Pick Redis/);
+
+  // Import the bundle (via stdin) into a fresh repo.
+  const b = initProject("@acme/beta");
+  const bundlePath = path.join(b, "bundle.md");
+  fs.writeFileSync(bundlePath, bundle);
+  const imported = runCli(b, "import", "bundle.md");
+  assert.match(imported, /Imported 2 file/);
+  assert.equal(store.listFiles("decisions", b).length, 1);
+  assert.equal(store.listFiles("patterns", b).length, 1);
+  const pg = store.readFile("decisions", store.listFiles("decisions", b)[0], b);
+  assert.match(pg, /summary: Redis for cache/, "front matter survives the round-trip");
+});
+
+test("e2e CLI: subcommands guard, help, and pull-with-no-remotes behave", () => {
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), "repomem-e2e-guard-"));
+  fs.writeFileSync(path.join(bare, "package.json"), "{}");
+
+  const status = cliResult(bare, "status");
+  assert.equal(status.code, 1, "status exits non-zero when uninitialised");
+  assert.match(status.out, /repomem init/);
+
+  const sync = cliResult(bare, "sync");
+  assert.equal(sync.code, 1, "sync exits non-zero when uninitialised");
+  assert.match(sync.out, /repomem init/);
+
+  const help = runCli(bare, "help");
+  for (const cmd of ["init", "setup", "status", "sync", "import", "pull"]) {
+    assert.match(help, new RegExp(`\\b${cmd}\\b`), `help lists ${cmd}`);
+  }
+
+  const root = initProject();
+  const pull = runCli(root, "pull");
+  assert.match(pull, /No remote linked repos/);
 });

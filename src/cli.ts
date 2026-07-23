@@ -156,7 +156,7 @@ function setupToml(target: string, agent: AgentSpec): boolean {
 function cmdStatus(): void {
   const root = cwd();
   if (!isInitialized(root)) {
-    console.log("✖ .repomem/ not found here. Run `repomem init` first.");
+    console.error("✖ .repomem/ not found here. Run `repomem init` first.");
     process.exitCode = 1;
     return;
   }
