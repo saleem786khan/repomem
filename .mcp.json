@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "repomem": {
+      "command": "npx",
+      "args": [
+        "@saleem11kh/repomem"
+      ]
+    }
+  }
+}
