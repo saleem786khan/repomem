@@ -38,9 +38,26 @@ const AGENTS: Record<string, AgentSpec> = {
   codex: { file: ".codex/config.toml", label: "Codex", format: "toml" },
 };
 
-const MCP_COMMAND = "npx";
-const MCP_ARGS = ["@saleem11kh/repomem"];
-const MCP_ENTRY = { command: MCP_COMMAND, args: MCP_ARGS };
+const NPM_PACKAGE = "@saleem11kh/repomem";
+
+export interface McpEntry {
+  command: string;
+  args: string[];
+}
+
+/**
+ * The server entry an agent should spawn, shaped for the host platform.
+ *
+ * Agents launch MCP servers with a bare spawn() and no shell. On Windows `npx`
+ * is `npx.cmd`, which such a spawn cannot resolve — it fails with ENOENT and the
+ * server silently shows as disconnected — so the command has to go through
+ * cmd.exe there.
+ */
+export function mcpEntry(platform: NodeJS.Platform = process.platform): McpEntry {
+  return platform === "win32"
+    ? { command: "cmd", args: ["/c", "npx", NPM_PACKAGE] }
+    : { command: "npx", args: [NPM_PACKAGE] };
+}
 
 function cwd(): string {
   return process.cwd();
@@ -105,6 +122,10 @@ function cmdSetup(agentArg?: string): void {
   if (!wired) return;
 
   console.log(`✔ Wired repomem into ${agent.label} (${agent.file})`);
+  if (process.platform === "win32") {
+    console.log("  Windows: the command is wrapped in `cmd /c` so agents can spawn it.");
+    console.log("  Teammates on macOS/Linux should re-run this to rewrite the entry.");
+  }
   if (agent.format === "toml") {
     console.log("  Codex only loads project config for trusted projects —");
     console.log("  run it from this dir and approve the trust prompt.");
@@ -127,7 +148,7 @@ function setupJson(target: string, agent: AgentSpec): boolean {
 
   const servers =
     (existing.mcpServers as Record<string, unknown>) ?? ({} as Record<string, unknown>);
-  servers.repomem = MCP_ENTRY;
+  servers.repomem = mcpEntry();
   existing.mcpServers = servers;
 
   fs.writeFileSync(target, JSON.stringify(existing, null, 2) + "\n", "utf8");
@@ -141,10 +162,11 @@ function setupToml(target: string, agent: AgentSpec): boolean {
     console.log(`• repomem already configured in ${agent.label} (${agent.file})`);
     return false;
   }
+  const entry = mcpEntry();
   const block = [
     "[mcp_servers.repomem]",
-    `command = ${JSON.stringify(MCP_COMMAND)}`,
-    `args = [${MCP_ARGS.map((a) => JSON.stringify(a)).join(", ")}]`,
+    `command = ${JSON.stringify(entry.command)}`,
+    `args = [${entry.args.map((a) => JSON.stringify(a)).join(", ")}]`,
     "",
   ].join("\n");
   const prefix = content.trim() ? content.replace(/\s*$/, "") + "\n\n" : "";
@@ -342,7 +364,10 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error("repomem error:", err);
-  process.exit(1);
-});
+// Run the CLI only when invoked as a script, so tests can import mcpEntry().
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("repomem error:", err);
+    process.exit(1);
+  });
+}

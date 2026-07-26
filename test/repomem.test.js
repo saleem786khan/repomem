@@ -269,13 +269,36 @@ function cliResult(root, ...args) {
   }
 }
 
+const { mcpEntry } = require("../dist/cli.js");
+
 test("cli setup claude-code writes .mcp.json at repo root (not .claude/)", () => {
   const root = makeProject();
   runCli(root, "setup", "claude-code");
   assert.ok(!fs.existsSync(path.join(root, ".claude", "mcp.json")), "must not use .claude/mcp.json");
   const cfg = JSON.parse(fs.readFileSync(path.join(root, ".mcp.json"), "utf8"));
-  assert.equal(cfg.mcpServers.repomem.command, "npx");
-  assert.deepEqual(cfg.mcpServers.repomem.args, ["@saleem11kh/repomem"]);
+  assert.deepEqual(cfg.mcpServers.repomem, mcpEntry(), "must match the host platform's entry");
+});
+
+// Agents spawn MCP servers without a shell; on Windows a bare `npx` is npx.cmd
+// and fails with ENOENT, so the entry must route through cmd.exe there.
+test("mcpEntry wraps the command in cmd /c on Windows only", () => {
+  assert.deepEqual(mcpEntry("win32"), {
+    command: "cmd",
+    args: ["/c", "npx", "@saleem11kh/repomem"],
+  });
+  for (const platform of ["darwin", "linux"]) {
+    assert.deepEqual(
+      mcpEntry(platform),
+      { command: "npx", args: ["@saleem11kh/repomem"] },
+      `${platform} must spawn npx directly`
+    );
+  }
+});
+
+test("importing the CLI does not execute it", () => {
+  // require.main guard: the test file above already required dist/cli.js, so a
+  // stray init/help side effect would have shown up as output or a thrown error.
+  assert.equal(typeof mcpEntry, "function");
 });
 
 test("cli setup codex writes TOML and is idempotent", () => {
@@ -283,9 +306,13 @@ test("cli setup codex writes TOML and is idempotent", () => {
   runCli(root, "setup", "codex");
   const tomlPath = path.join(root, ".codex", "config.toml");
   const toml = fs.readFileSync(tomlPath, "utf8");
+  const entry = mcpEntry();
   assert.match(toml, /^\[mcp_servers\.repomem\]/m);
-  assert.match(toml, /command = "npx"/);
-  assert.match(toml, /args = \["@saleem11kh\/repomem"\]/);
+  assert.ok(toml.includes(`command = ${JSON.stringify(entry.command)}`), "command must match host platform");
+  assert.ok(
+    toml.includes(`args = [${entry.args.map((a) => JSON.stringify(a)).join(", ")}]`),
+    "args must match host platform"
+  );
   // second run must not duplicate the block
   const second = runCli(root, "setup", "codex");
   assert.match(second, /already configured/);
