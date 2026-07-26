@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "repomem": {
-      "command": "npx",
+      "command": "node",
       "args": [
-        "@saleem11kh/repomem"
+        "dist/cli.js"
       ]
     }
   }

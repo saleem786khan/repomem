@@ -16,7 +16,8 @@ _none yet_
 - [Memory filenames encode date and slug](patterns/2026-07-26-memory-filenames-encode-date-and-slug.md)
 - [MCP tools are ToolDefs that return strings](patterns/2026-07-26-mcp-tools-are-tooldefs-that-return-strings.md)
 
-## issues (3)
+## issues (4)
 - [Search matches substrings, not words](issues/2026-07-26-search-matches-substrings-not-words.md)
 - [Same-day slug collisions overwrite silently](issues/2026-07-26-same-day-slug-collisions-overwrite.md)
 - [mem_prime has no CLI equivalent](issues/2026-07-26-mem-prime-has-no-cli-equivalent.md)
+- [MCP configs must route through cmd.exe on Windows](issues/2026-07-26-mcp-configs-must-route-through-cmd-exe-on-windows.md)
