@@ -21,6 +21,13 @@ export function timestamp(): string {
   return `${today()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+/** HHMM in local time — zero-padded so filenames sort chronologically. */
+export function clock(): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d.getHours())}${pad(d.getMinutes())}`;
+}
+
 /** Turn a title into a filesystem-safe kebab slug. */
 export function slugify(title: string): string {
   return title

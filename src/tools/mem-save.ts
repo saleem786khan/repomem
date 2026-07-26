@@ -1,11 +1,16 @@
+import * as fs from "fs";
+import * as path from "path";
+
 import {
   MemoryType,
   MEMORY_TYPES,
   writeFile,
   generateIndex,
+  getRepomemRoot,
   isInitialized,
 } from "../store/file-store.js";
 import { ToolDef, today, timestamp, slugify, str, strArray } from "./util.js";
+import { nameSession, reserveSessionFile, sessionFrontMatter } from "./session.js";
 
 const TYPE_ALIASES: Record<string, MemoryType> = {
   decision: "decisions",
@@ -17,6 +22,20 @@ const TYPE_ALIASES: Record<string, MemoryType> = {
   issue: "issues",
   issues: "issues",
 };
+
+/**
+ * Write the session file's front matter the first time it is touched. Later
+ * writes just append blocks, so the header reflects when the session opened.
+ */
+export function ensureSessionHeader(
+  filename: string,
+  summary: string,
+  projectRoot: string
+): void {
+  const filePath = path.join(getRepomemRoot(projectRoot), "sessions", filename);
+  if (fs.existsSync(filePath)) return;
+  writeFile("sessions", filename, sessionFrontMatter(summary), {}, projectRoot);
+}
 
 export const memSave: ToolDef = {
   name: "mem_save",
@@ -57,6 +76,13 @@ export const memSave: ToolDef = {
         description:
           "Optional filename of a prior decision this one replaces (decisions only).",
       },
+      session: {
+        type: "string",
+        description:
+          "Optional name for the running session (sessions only), e.g. 'auth-refactor'. " +
+          "Names the session file so parallel sessions stay separate and findable. " +
+          "Set it once; later saves reuse it.",
+      },
     },
     required: ["type", "title", "content"],
   },
@@ -84,9 +110,15 @@ export const memSave: ToolDef = {
       ? `\nRelated: ${links.map((l) => `[[${slugify(l)}]]`).join(" ")}\n`
       : "";
 
-    // Sessions are date-keyed and appended to across a single day.
+    // One file per session, appended to as the session goes. Named so that
+    // parallel sessions never share a file — see ./session.ts.
     if (type === "sessions") {
-      const filename = `${today()}.md`;
+      const sessionName = str(args.session);
+      const filename = sessionName
+        ? nameSession(sessionName, projectRoot)
+        : reserveSessionFile(projectRoot);
+      ensureSessionHeader(filename, summary || title, projectRoot);
+
       const block =
         `\n## ${timestamp()} — ${title}\n\n` +
         (tags.length ? `_tags: ${tags.join(", ")}_\n\n` : "") +

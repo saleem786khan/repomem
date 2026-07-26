@@ -35,8 +35,23 @@ export function isInitialized(projectRoot: string = findProjectRoot()): boolean 
 }
 
 /**
+ * Chronological sort key for a memory filename: its `YYYY-MM-DD` prefix plus the
+ * `HHMM` that session files carry.
+ *
+ * Sorting raw names would be wrong here: `-` (0x2D) sorts before `.` (0x2E), so
+ * a legacy whole-day `2026-07-26.md` would outrank `2026-07-26-0917-x.md` from
+ * the same date and be mistaken for the newer file. Legacy day files get `0000`
+ * so any timed session that day counts as newer.
+ */
+function fileOrderKey(filename: string): string {
+  const m = filename.match(/^(\d{4}-\d{2}-\d{2})(?:-(\d{4})(?=-|\.))?/);
+  if (!m) return "0000-00-00-0000";
+  return `${m[1]}-${m[2] ?? "0000"}`;
+}
+
+/**
  * List relative file paths (from .repomem/) of a given memory type, sorted
- * newest-first by filename. Returns [] when uninitialised or empty.
+ * newest-first. Returns [] when uninitialised or empty.
  */
 export function listFiles(
   type: MemoryType,
@@ -47,7 +62,11 @@ export function listFiles(
     return fs
       .readdirSync(dir)
       .filter((f) => f.endsWith(".md"))
-      .sort()
+      .sort((a, b) => {
+        const ka = fileOrderKey(a);
+        const kb = fileOrderKey(b);
+        return ka === kb ? a.localeCompare(b) : ka < kb ? -1 : 1;
+      })
       .reverse();
   } catch {
     return [];
@@ -149,9 +168,15 @@ export function parseLinks(raw: string): string[] {
   return [...out];
 }
 
-/** Strip the date prefix and extension from a memory filename to get its slug. */
+/**
+ * Strip the date (and, for session files, the HHMM) prefix and the extension to
+ * get a memory's slug — the thing [[wikilinks]] match against.
+ */
 function fileSlug(filename: string): string {
-  return filename.replace(/\.md$/i, "").replace(/^\d{4}-\d{2}-\d{2}-?/, "").toLowerCase();
+  return filename
+    .replace(/\.md$/i, "")
+    .replace(/^\d{4}-\d{2}-\d{2}-?(?:\d{4}-)?/, "")
+    .toLowerCase();
 }
 
 export interface ResolvedLink {

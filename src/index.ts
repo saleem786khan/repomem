@@ -13,6 +13,7 @@ import { memContext } from "./tools/mem-context.js";
 import { memHandoff } from "./tools/mem-handoff.js";
 import { memGet } from "./tools/mem-get.js";
 import { memPrime } from "./tools/mem-prime.js";
+import { setSessionAgent } from "./tools/session.js";
 
 const TOOLS: ToolDef[] = [
   memSave,
@@ -41,6 +42,14 @@ export async function startServer(): Promise<void> {
         "repomem, call mem_prime once to bootstrap memory from existing docs.",
     }
   );
+
+  // Attribute session memory to whichever agent connected. The client announces
+  // itself in `initialize`, so this costs nothing and makes parallel sessions
+  // from different agents tellable apart.
+  server.oninitialized = () => {
+    const client = server.getClientVersion();
+    if (client?.name) setSessionAgent(client.name);
+  };
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: TOOLS.map((t) => ({

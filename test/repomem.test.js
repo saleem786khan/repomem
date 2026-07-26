@@ -176,15 +176,117 @@ test("mem_save writes a decision with front matter + supersedes", () => {
   assert.match(raw, /# Use Postgres for ledger/);
 });
 
-test("mem_save appends sessions for the same day into one file", () => {
+const session = require("../dist/tools/session.js");
+
+test("mem_save appends within one session to a single file", () => {
+  session.resetSession();
   const root = makeProject();
   memSave.handler({ type: "session", title: "Morning", content: "did A" }, root);
   memSave.handler({ type: "session", title: "Afternoon", content: "did B" }, root);
   const files = store.listFiles("sessions", root);
-  assert.equal(files.length, 1, "one session file per day");
+  assert.equal(files.length, 1, "one file per session, not per write");
   const raw = store.readFile("sessions", files[0], root);
   assert.match(raw, /Morning/);
   assert.match(raw, /Afternoon/);
+  assert.match(files[0], /^\d{4}-\d{2}-\d{2}-\d{4}-/, "filename carries the start time");
+});
+
+test("session files are named, and naming renames the file in place", () => {
+  session.resetSession();
+  const root = makeProject();
+  memSave.handler({ type: "session", title: "Start", content: "poking around" }, root);
+  const before = store.listFiles("sessions", root);
+  assert.match(before[0], /-untitled\.md$/, "unnamed sessions fall back to untitled");
+
+  memSave.handler(
+    { type: "session", title: "Now I know", content: "it is the auth work", session: "auth-refactor" },
+    root
+  );
+  const after = store.listFiles("sessions", root);
+  assert.equal(after.length, 1, "renamed, not duplicated");
+  assert.match(after[0], /-auth-refactor\.md$/);
+  const raw = store.readFile("sessions", after[0], root);
+  assert.match(raw, /poking around/, "content written before the rename survives");
+  assert.match(raw, /it is the auth work/);
+});
+
+test("parallel sessions on one day get separate files, even in the same minute", () => {
+  const root = makeProject();
+  session.resetSession();
+  memHandoff.handler({ summary: "agent one work", session: "auth-refactor" }, root);
+  session.resetSession(); // a second session starting alongside the first
+  memHandoff.handler({ summary: "agent two work", session: "auth-refactor" }, root);
+
+  const files = store.listFiles("sessions", root);
+  assert.equal(files.length, 2, "two sessions must never share a file");
+  const bodies = files.map((f) => store.readFile("sessions", f, root));
+  assert.equal(
+    bodies.filter((b) => b.includes("agent one work")).length,
+    1,
+    "each session's work lands in exactly one file"
+  );
+  assert.ok(
+    bodies.some((b) => b.includes("agent two work")),
+    "the colliding session must still be written"
+  );
+});
+
+test("session front matter records name, start, and connected agent", () => {
+  session.resetSession();
+  session.setSessionAgent("claude-code");
+  const root = makeProject();
+  memHandoff.handler({ summary: "shipped the thing", session: "release-work" }, root);
+
+  const raw = store.readFile("sessions", store.listFiles("sessions", root)[0], root);
+  assert.match(raw, /^---/, "sessions now carry front matter like every other type");
+  assert.match(raw, /session: release-work/);
+  assert.match(raw, /agent: claude-code/);
+  assert.match(raw, /started: \d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
+  assert.match(raw, /summary: shipped the thing/);
+  assert.equal(
+    store.summaryOf(raw, "x.md"),
+    "shipped the thing",
+    "the summary field makes sessions summarisable"
+  );
+});
+
+test("mem_context names parallel sessions without inlining them", () => {
+  const root = makeProject();
+  session.resetSession();
+  memHandoff.handler({ summary: "the auth work", session: "auth-refactor" }, root);
+  session.resetSession();
+  memHandoff.handler({ summary: "the docs work", session: "docs-pass" }, root);
+
+  const full = memContext.handler({}, root);
+  assert.match(full, /## Also today/, "parallel sessions must be visible");
+  const [inlined, alsoToday] = full.split("## Also today");
+  assert.match(alsoToday, /auth-refactor|docs-pass/);
+  // Exactly one session is inlined; the other appears only as a one-liner.
+  assert.ok(
+    (inlined.match(/the auth work/) ? 1 : 0) + (inlined.match(/the docs work/) ? 1 : 0) === 1,
+    "only the newest session is inlined"
+  );
+});
+
+test("[[wikilinks]] resolve to a timed session file", () => {
+  session.resetSession();
+  const root = makeProject();
+  memHandoff.handler({ summary: "the auth work", session: "auth-refactor" }, root);
+  const hit = store.resolveLink("auth-refactor", root);
+  assert.ok(hit, "the HHMM prefix must not break slug resolution");
+  assert.equal(hit.type, "sessions");
+});
+
+test("listFiles orders a timed session after a legacy whole-day file", () => {
+  const root = makeProject();
+  // `-` sorts before `.`, so a raw name sort would call the legacy file newer.
+  store.writeFile("sessions", "2026-07-26.md", "# legacy day file\n", {}, root);
+  store.writeFile("sessions", "2026-07-26-0917-morning.md", "# timed\n", {}, root);
+  assert.equal(
+    store.listFiles("sessions", root)[0],
+    "2026-07-26-0917-morning.md",
+    "a timed session that day is newer than the legacy day file"
+  );
 });
 
 test("mem_save rejects unknown type", () => {
@@ -222,6 +324,43 @@ test("mem_context brief and full assemble a packet", () => {
   assert.match(full, /Gotcha/);
 });
 
+test("mem_context inlines only the newest handoff block, not the whole day", () => {
+  const root = makeProject();
+  memHandoff.handler({ summary: "morning work", next: ["ship the thing"] }, root);
+  memHandoff.handler({ summary: "afternoon work", next: ["review the PR"] }, root);
+
+  const full = memContext.handler({}, root);
+  assert.match(full, /afternoon work/, "must carry the newest handoff");
+  assert.ok(!full.includes("morning work"), "must not inline earlier handoffs from the same day");
+});
+
+test("mem_context drops Done from a long session but keeps Next and Blockers", () => {
+  const root = makeProject();
+  memHandoff.handler(
+    {
+      summary: "a very busy day",
+      done: Array.from({ length: 30 }, (_, i) => `finished task ${i}`),
+      next: ["the one thing that matters"],
+      blockers: ["waiting on review"],
+    },
+    root
+  );
+
+  const full = memContext.handler({}, root);
+  assert.match(full, /a very busy day/, "keeps the summary");
+  assert.match(full, /the one thing that matters/, "keeps Next");
+  assert.match(full, /waiting on review/, "keeps Blockers");
+  assert.ok(!full.includes("finished task 0"), "drops the Done history");
+  assert.match(full, /Trimmed — full session via mem_get/);
+
+  // The untrimmed file is still there in full for mem_get to expand.
+  const raw = fs.readFileSync(
+    path.join(root, ".repomem", "sessions", fs.readdirSync(path.join(root, ".repomem", "sessions"))[0]),
+    "utf8"
+  );
+  assert.match(raw, /finished task 0/, "the session file itself must keep everything");
+});
+
 test("mem_handoff writes structured handoff and commit reminder", () => {
   const root = makeProject();
   const out = memHandoff.handler(
@@ -248,6 +387,136 @@ test("mem_handoff requires a summary", () => {
   const root = makeProject();
   const out = memHandoff.handler({}, root);
   assert.match(out, /summary is required/);
+});
+
+// ---------------------------------------------------------------------------
+// git-derived handoffs — the factual half of a handoff comes from the repo, not
+// from the agent's recollection.
+// ---------------------------------------------------------------------------
+
+/** An initialised project that is also a real git repo with one old commit. */
+function makeGitProject() {
+  const root = makeProject();
+  const run = (args, extraEnv) =>
+    execFileSync("git", args, {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, ...extraEnv },
+    });
+  run(["init", "-q"]);
+  run(["config", "user.email", "test@example.com"]);
+  run(["config", "user.name", "Test"]);
+  fs.writeFileSync(path.join(root, "old.txt"), "old\n");
+  run(["add", "."]);
+  // Backdated so it falls outside any session window.
+  const old = "2020-01-01T00:00:00";
+  run(["commit", "-q", "-m", "chore: ancient history"], {
+    GIT_AUTHOR_DATE: old,
+    GIT_COMMITTER_DATE: old,
+  });
+  return { root, run };
+}
+
+test("mem_handoff fills Committed from commits made since the session began", () => {
+  session.resetSession();
+  const { root, run } = makeGitProject();
+  fs.writeFileSync(path.join(root, "feature.txt"), "new\n");
+  run(["add", "."]);
+  run(["commit", "-q", "-m", "feat: add the feature"]);
+
+  const raw = store.readFile(
+    "sessions",
+    (memHandoff.handler({ summary: "did the work" }, root),
+    store.listFiles("sessions", root)[0]),
+    root
+  );
+  assert.match(raw, /\*\*Committed this session:\*\*/);
+  assert.match(raw, /feat: add the feature/);
+  assert.ok(
+    !raw.includes("ancient history"),
+    "commits from before the session must not be claimed"
+  );
+});
+
+test("mem_handoff lists uncommitted work but ignores its own .repomem writes", () => {
+  session.resetSession();
+  const { root } = makeGitProject();
+  fs.writeFileSync(path.join(root, "wip.txt"), "half done\n");
+
+  memHandoff.handler({ summary: "left things in flight" }, root);
+  const raw = store.readFile("sessions", store.listFiles("sessions", root)[0], root);
+  const uncommitted = raw.split("**Still uncommitted:**")[1] || "";
+  assert.match(raw, /\*\*Still uncommitted:\*\*/);
+  assert.match(uncommitted, /wip\.txt/);
+  // Matched loosely on purpose: a leading-space parsing bug once turned
+  // ".repomem/…" into "repomem/…", which slipped past a `.repomem/` check.
+  assert.ok(!/repomem/i.test(uncommitted), "the handoff must not report itself as churn");
+});
+
+test("git status parsing keeps the leading status columns intact", () => {
+  const gitStore = require("../dist/store/git.js");
+  const { root } = makeGitProject();
+  fs.writeFileSync(path.join(root, "a-sorts-first.txt"), "x\n");
+  fs.writeFileSync(path.join(root, "z-sorts-last.txt"), "y\n");
+  const activity = gitStore.activitySince("2019-01-01 00:00", root);
+  for (const entry of activity.changed) {
+    assert.match(
+      entry,
+      /^[A-Z?!]{1,2} \S/,
+      `every entry needs its status code and a whole path, got "${entry}"`
+    );
+  }
+  assert.ok(
+    activity.changed.some((e) => e.endsWith("a-sorts-first.txt")),
+    "the first porcelain line must survive parsing with its path intact"
+  );
+});
+
+test("mem_handoff records the branch", () => {
+  session.resetSession();
+  const { root, run } = makeGitProject();
+  run(["checkout", "-q", "-b", "feature/auth"]);
+  memHandoff.handler({ summary: "on a branch" }, root);
+  const raw = store.readFile("sessions", store.listFiles("sessions", root)[0], root);
+  assert.match(raw, /_branch: feature\/auth_/);
+});
+
+test("mem_handoff git detail can be switched off", () => {
+  session.resetSession();
+  const { root } = makeGitProject();
+  fs.writeFileSync(path.join(root, "wip.txt"), "half done\n");
+  memHandoff.handler({ summary: "no git detail please", git: false }, root);
+  const raw = store.readFile("sessions", store.listFiles("sessions", root)[0], root);
+  assert.ok(!raw.includes("Still uncommitted"));
+  assert.ok(!raw.includes("_branch:"));
+  assert.match(raw, /no git detail please/);
+});
+
+test("mem_handoff works in a project that is not a git repo", () => {
+  session.resetSession();
+  const root = makeProject(); // no git init
+  const out = memHandoff.handler({ summary: "no git here", next: ["carry on"] }, root);
+  assert.match(out, /Handoff written/);
+  const raw = store.readFile("sessions", store.listFiles("sessions", root)[0], root);
+  assert.match(raw, /no git here/);
+  assert.match(raw, /\*\*Next:\*\*/);
+  assert.ok(!raw.includes("Committed this session"), "nothing to derive, nothing claimed");
+});
+
+test("git.activitySince returns null outside a repo and data inside one", () => {
+  const gitStore = require("../dist/store/git.js");
+  assert.equal(gitStore.isGitRepo(makeProject()), false);
+  assert.equal(gitStore.activitySince("2020-01-01 00:00", makeProject()), null);
+
+  const { root } = makeGitProject();
+  const activity = gitStore.activitySince("2019-01-01 00:00", root);
+  assert.ok(activity, "a real repo must report activity");
+  assert.ok(
+    activity.commits.some((c) => c.includes("ancient history")),
+    "a wide enough window includes the old commit"
+  );
+  assert.equal(activity.moreCommits, 0);
 });
 
 // ---------------------------------------------------------------------------

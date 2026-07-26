@@ -1,12 +1,18 @@
 import { writeFile, generateIndex, isInitialized } from "../store/file-store.js";
-import { ToolDef, today, timestamp, str, strArray } from "./util.js";
+import { activitySince } from "../store/git.js";
+import { ToolDef, timestamp, str, strArray } from "./util.js";
+import { ensureSessionHeader } from "./mem-save.js";
+import { nameSession, reserveSessionFile, sessionState } from "./session.js";
 
 export const memHandoff: ToolDef = {
   name: "mem_handoff",
   description:
-    "Close out a session: write a structured handoff to sessions/YYYY-MM-DD.md so " +
-    "the next session (you, a teammate, or a different agent) picks up exactly where " +
-    "this one left off. Records what was done, what's next, and any blockers.",
+    "Close out a session: write a structured handoff to sessions/ so the next " +
+    "session (you, a teammate, or a different agent) picks up exactly where this one " +
+    "left off. Records what was done, what's next, and any blockers. Commits made and " +
+    "files still uncommitted since the session began are filled in from git " +
+    "automatically — you only need to supply the parts git cannot know: why, and " +
+    "what's next.",
   inputSchema: {
     type: "object",
     properties: {
@@ -26,6 +32,18 @@ export const memHandoff: ToolDef = {
         items: { type: "string" },
         description: "Open blockers or gotchas.",
       },
+      session: {
+        type: "string",
+        description:
+          "Optional name for this session, e.g. 'auth-refactor'. Names the session " +
+          "file so parallel sessions stay separate and findable in mem_context.",
+      },
+      git: {
+        type: "boolean",
+        description:
+          "Include commits and uncommitted changes since the session began. " +
+          "Default true; set false to write a handoff with no git detail.",
+      },
     },
     required: ["summary"],
   },
@@ -40,12 +58,31 @@ export const memHandoff: ToolDef = {
     const next = strArray(args.next);
     const blockers = strArray(args.blockers);
 
+    // The factual half comes from git; the agent supplies the judgement half.
+    const activity =
+      args.git === false ? null : activitySince(sessionState().startedAt, projectRoot);
+
     const lines: string[] = [];
     lines.push(`\n## ${timestamp()} — Handoff`, "");
     lines.push(summary, "");
+    if (activity?.branch) {
+      lines.push(`_branch: ${activity.branch}_`, "");
+    }
     if (done.length) {
       lines.push("**Done:**");
       for (const d of done) lines.push(`- ${d}`);
+      lines.push("");
+    }
+    if (activity?.commits.length) {
+      lines.push("**Committed this session:**");
+      for (const c of activity.commits) lines.push(`- ${c}`);
+      if (activity.moreCommits) lines.push(`- _…and ${activity.moreCommits} more_`);
+      lines.push("");
+    }
+    if (activity?.changed.length) {
+      lines.push("**Still uncommitted:**");
+      for (const c of activity.changed) lines.push(`- ${c}`);
+      if (activity.moreChanged) lines.push(`- _…and ${activity.moreChanged} more_`);
       lines.push("");
     }
     if (next.length) {
@@ -59,14 +96,19 @@ export const memHandoff: ToolDef = {
       lines.push("");
     }
 
-    const filename = `${today()}.md`;
+    const sessionName = str(args.session);
+    const filename = sessionName
+      ? nameSession(sessionName, projectRoot)
+      : reserveSessionFile(projectRoot);
+    ensureSessionHeader(filename, summary, projectRoot);
+
     writeFile("sessions", filename, lines.join("\n"), { append: true }, projectRoot);
     generateIndex(projectRoot);
 
     return (
       `✔ Handoff written to sessions/${filename}\n\n` +
       "Commit it so your team and next session inherit it:\n" +
-      `  git add .repomem/ && git commit -m "memory: session handoff ${today()}"`
+      `  git add .repomem/ && git commit -m "memory: session handoff ${filename.replace(/\.md$/, "")}"`
     );
   },
 };
