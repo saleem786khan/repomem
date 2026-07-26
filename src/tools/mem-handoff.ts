@@ -44,6 +44,13 @@ export const memHandoff: ToolDef = {
           "Include commits and uncommitted changes since the session began. " +
           "Default true; set false to write a handoff with no git detail.",
       },
+      since: {
+        type: "string",
+        description:
+          "Override the git window, as 'YYYY-MM-DD HH:MM'. Defaults to when this " +
+          "session started. Used by `repomem capture`, which runs in its own process " +
+          "and so has no session to measure from.",
+      },
     },
     required: ["summary"],
   },
@@ -59,8 +66,8 @@ export const memHandoff: ToolDef = {
     const blockers = strArray(args.blockers);
 
     // The factual half comes from git; the agent supplies the judgement half.
-    const activity =
-      args.git === false ? null : activitySince(sessionState().startedAt, projectRoot);
+    const since = str(args.since) || sessionState().startedAt;
+    const activity = args.git === false ? null : activitySince(since, projectRoot);
 
     const lines: string[] = [];
     lines.push(`\n## ${timestamp()} — Handoff`, "");

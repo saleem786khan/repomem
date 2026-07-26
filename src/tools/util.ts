@@ -4,7 +4,15 @@ export interface ToolDef {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
-  handler: (args: Record<string, unknown>, projectRoot: string) => string;
+  /**
+   * Returns the tool's text, or a promise of it. Only mem_search ever goes async,
+   * and only when semantic search is switched on — every other tool, and search
+   * itself in the default configuration, stays synchronous.
+   */
+  handler: (
+    args: Record<string, unknown>,
+    projectRoot: string
+  ) => string | Promise<string>;
 }
 
 /** YYYY-MM-DD in local time. */

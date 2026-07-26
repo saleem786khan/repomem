@@ -326,16 +326,23 @@ function countTerm(haystack: string, term: string): number {
   return n;
 }
 
+export interface ScoredEntry {
+  file: string;
+  type: MemoryType;
+  filename: string;
+  raw: string;
+  score: number;
+}
+
 /**
- * Full-text search across all memory types in a single project root, ranked by
- * TF-IDF (rarer query terms weigh more), normalised for document length, with a
- * recency boost. Case-insensitive over plain-markdown stores.
+ * BM25 × recency score for every entry matching `query`, highest first.
+ *
+ * Shared by mem_search (which renders excerpts) and mem_context (which ranks a
+ * context packet against the task at hand). Extracted so both use one ranking —
+ * two implementations would drift, and "why did search and context disagree?"
+ * is not a question worth having.
  */
-function searchInRoot(
-  query: string,
-  scope: string,
-  projectRoot: string
-): SearchResult[] {
+export function scoreEntries(query: string, projectRoot: string): ScoredEntry[] {
   const terms = [
     ...new Set(
       query
@@ -386,7 +393,7 @@ function searchInRoot(
   // normalisation (b) keep a doc that merely repeats a common term from
   // outranking one containing the rare, discriminating term.
   const avgdl = docs.reduce((s, d) => s + d.length, 0) / docs.length;
-  const results: SearchResult[] = [];
+  const scored: ScoredEntry[] = [];
   for (const doc of docs) {
     let score = 0;
     for (const [term, tf] of doc.counts) {
@@ -400,17 +407,42 @@ function searchInRoot(
     score *= recency;
     if (score <= 0) continue;
 
-    const { body } = splitFrontMatter(doc.raw);
-    results.push({
+    scored.push({
       file: doc.file,
-      scope,
-      title: titleOf(doc.raw, doc.filename),
-      excerpt: makeExcerpt(body, terms),
+      type: doc.type,
+      filename: doc.filename,
+      raw: doc.raw,
       score,
-      related: relatedOf(doc.raw, projectRoot).map((r) => r.title),
     });
   }
-  return results;
+  return scored.sort((a, b) => b.score - a.score);
+}
+
+/**
+ * Full-text search across all memory types in a single project root, rendered
+ * with excerpts and related links for display.
+ */
+function searchInRoot(
+  query: string,
+  scope: string,
+  projectRoot: string
+): SearchResult[] {
+  const terms = query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((t) => t.length > 0);
+
+  return scoreEntries(query, projectRoot).map((entry) => {
+    const { body } = splitFrontMatter(entry.raw);
+    return {
+      file: entry.file,
+      scope,
+      title: titleOf(entry.raw, entry.filename),
+      excerpt: makeExcerpt(body, terms),
+      score: entry.score,
+      related: relatedOf(entry.raw, projectRoot).map((r) => r.title),
+    };
+  });
 }
 
 /** Pull a short window of text around the first matched term. */
@@ -439,6 +471,53 @@ export function searchFiles(
   return searchInRoot(query, "[current]", projectRoot)
     .sort((a, b) => b.score - a.score)
     .slice(0, 10);
+}
+
+/**
+ * Fold semantic similarity into lexical results.
+ *
+ * Semantic scores augment BM25 rather than replace it: BM25 is precise when the
+ * caller knows the vocabulary, embeddings recall entries that share no words with
+ * the query. Entries only the vector index found are appended, so a semantic hit
+ * can surface memory that lexical search could never reach.
+ */
+export function blendSemantic(
+  lexical: SearchResult[],
+  semantic: Map<string, number>,
+  projectRoot: string,
+  blend: number
+): SearchResult[] {
+  if (semantic.size === 0) return lexical;
+
+  const maxLexical = lexical.reduce((m, r) => Math.max(m, r.score), 0) || 1;
+  const merged = new Map<string, SearchResult>();
+
+  for (const result of lexical) {
+    const sem = semantic.get(result.file) ?? 0;
+    merged.set(result.file, {
+      ...result,
+      score: (1 - blend) * (result.score / maxLexical) + blend * sem,
+    });
+  }
+
+  for (const [file, sem] of semantic) {
+    if (merged.has(file)) continue;
+    const [type, filename] = file.split("/", 2);
+    const raw = readFile(type as MemoryType, filename, projectRoot);
+    if (raw == null) continue;
+    const { body } = splitFrontMatter(raw);
+    merged.set(file, {
+      file,
+      scope: "[current]",
+      title: titleOf(raw, filename),
+      // No query terms matched, so lead with the entry's own opening line.
+      excerpt: body.replace(/\s+/g, " ").trim().slice(0, 160),
+      score: blend * sem,
+      related: relatedOf(raw, projectRoot).map((r) => r.title),
+    });
+  }
+
+  return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, 10);
 }
 
 /** Cache root for a pulled remote repo — a project-root-shaped dir under .repomem/.cache/. */

@@ -43,14 +43,6 @@ export async function startServer(): Promise<void> {
     }
   );
 
-  // Attribute session memory to whichever agent connected. The client announces
-  // itself in `initialize`, so this costs nothing and makes parallel sessions
-  // from different agents tellable apart.
-  server.oninitialized = () => {
-    const client = server.getClientVersion();
-    if (client?.name) setSessionAgent(client.name);
-  };
-
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: TOOLS.map((t) => ({
       name: t.name,
@@ -67,9 +59,16 @@ export async function startServer(): Promise<void> {
         isError: true,
       };
     }
+    // Attribute session memory to whichever agent connected. Read here rather
+    // than from an `oninitialized` callback: that fires on the client's
+    // `initialized` notification, which is optional in practice, and a session
+    // written before it arrives would lose its attribution silently.
+    const client = server.getClientVersion();
+    if (client?.name) setSessionAgent(client.name);
+
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
     try {
-      const text = tool.handler(args, findProjectRoot());
+      const text = await tool.handler(args, findProjectRoot());
       return { content: [{ type: "text", text }] };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

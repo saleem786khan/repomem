@@ -1,4 +1,11 @@
-import { searchFiles, searchAllRepos, isInitialized } from "../store/file-store.js";
+import {
+  searchFiles,
+  searchAllRepos,
+  blendSemantic,
+  isInitialized,
+} from "../store/file-store.js";
+import { loadConfig } from "../config/config.js";
+import { semanticScores } from "../store/embeddings.js";
 import { ToolDef, str } from "./util.js";
 
 export const memSearch: ToolDef = {
@@ -28,22 +35,32 @@ export const memSearch: ToolDef = {
     if (!query) return "✖ A search query is required.";
 
     const includeLinked = args.linked === true;
-    const results = includeLinked
+    const lexical = includeLinked
       ? searchAllRepos(query, projectRoot)
       : searchFiles(query, projectRoot);
 
-    if (results.length === 0) {
-      return `No memory found for "${query}".`;
-    }
+    const semantic = loadConfig(projectRoot).semantic;
+    if (!semantic) return render(lexical, query);
 
-    const lines = [`Found ${results.length} match(es) for "${query}":`, ""];
-    for (const r of results) {
-      lines.push(`${r.scope} ${r.title}  ·  ${r.file}`);
-      lines.push(`   ${r.excerpt}`);
-      if (r.related.length) lines.push(`   → related: ${r.related.join(", ")}`);
-      lines.push("");
-    }
-    lines.push('_Expand any entry with mem_get("type/filename")._');
-    return lines.join("\n").trimEnd();
+    // Only this branch is async, so search stays synchronous for everyone who
+    // has not turned semantic search on.
+    const blend = Math.min(1, Math.max(0, semantic.blend ?? 0.5));
+    return semanticScores(query, projectRoot, semantic)
+      .then((scores) => render(blendSemantic(lexical, scores, projectRoot, blend), query))
+      .catch(() => render(lexical, query));
   },
 };
+
+function render(results: { scope: string; title: string; file: string; excerpt: string; related: string[] }[], query: string): string {
+  if (results.length === 0) return `No memory found for "${query}".`;
+
+  const lines = [`Found ${results.length} match(es) for "${query}":`, ""];
+  for (const r of results) {
+    lines.push(`${r.scope} ${r.title}  ·  ${r.file}`);
+    lines.push(`   ${r.excerpt}`);
+    if (r.related.length) lines.push(`   → related: ${r.related.join(", ")}`);
+    lines.push("");
+  }
+  lines.push('_Expand any entry with mem_get("type/filename")._');
+  return lines.join("\n").trimEnd();
+}
