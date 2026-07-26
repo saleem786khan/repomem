@@ -6,10 +6,31 @@ export interface LinkedRepo {
   relation?: string;
 }
 
+/**
+ * Optional semantic search. Absent means off — no embedding calls, no cache, no
+ * behaviour change. repomem never bundles a model; the provider is always
+ * something you already run.
+ */
+export interface SemanticConfig {
+  provider: "ollama" | "openai-compatible" | "command";
+  /** Model name passed to an HTTP provider. */
+  model?: string;
+  /** Endpoint. Defaults to Ollama's localhost address for provider "ollama". */
+  url?: string;
+  /** Env var holding a bearer token, for hosted OpenAI-compatible endpoints. */
+  apiKeyEnv?: string;
+  /** Executable for provider "command": reads text on stdin, prints a JSON array. */
+  command?: string;
+  args?: string[];
+  /** Semantic share of the blended score, 0–1. Defaults to 0.5. */
+  blend?: number;
+}
+
 export interface RepomemConfig {
   project: string;
   workspace?: string;
   linked: LinkedRepo[];
+  semantic?: SemanticConfig;
 }
 
 export const CONFIG_FILENAME = "repomem.config.json";
@@ -53,6 +74,7 @@ export function loadConfig(projectRoot: string = findProjectRoot()): RepomemConf
       project: parsed.project || deriveProjectName(projectRoot),
       workspace: parsed.workspace,
       linked: Array.isArray(parsed.linked) ? parsed.linked : [],
+      semantic: parsed.semantic,
     };
   } catch {
     return { ...DEFAULT_CONFIG, project: deriveProjectName(projectRoot) };
