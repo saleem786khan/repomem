@@ -38,6 +38,7 @@ your-project/
     ├── sessions/      ← what was done, what's next
     ├── patterns/      ← reusable conventions for this codebase
     ├── issues/        ← known gotchas, do-not-repeat mistakes
+    ├── project.md     ← auto-generated profile: stack, commands, layout
     └── REPOMEM.md     ← auto-generated index of everything above
 ```
 
@@ -84,9 +85,9 @@ Your agent calls these; you don't type them.
 
 | Tool | Arguments | What it does |
 |---|---|---|
-| `mem_context` | `brief?` | Session-start packet: the last session, plus one-line summaries of decisions, patterns, and issues. Call it first. |
+| `mem_context` | `task?`, `budget?`, `brief?` | Session-start packet: the project profile, the last session, plus one-line summaries of decisions, patterns, and issues. Call it first. |
 | `mem_get` | `file` | Expand one entry in full — by `type/filename`, bare filename, or `[[wikilink]]` slug. |
-| `mem_search` | `query`, `linked?` | BM25 + recency ranked search across all memory. `linked=true` also searches linked repos and the workspace. |
+| `mem_search` | `query`, `linked?` | BM25 + recency ranked search across all memory, blended with semantic similarity when enabled. `linked=true` also searches linked repos and the workspace. |
 | `mem_save` | `type`, `title`, `content`, `summary?`, `tags?`, `links?`, `supersedes?`, `session?` | Write a `decision`, `pattern`, `issue`, or `session` note. |
 | `mem_handoff` | `summary`, `done?`, `next?`, `blockers?`, `session?`, `git?` | Close out a session so the next one picks up exactly where you left off. Fills in what changed from git. |
 | `mem_prime` | — | Bootstrap memory on an existing repo from its `CLAUDE.md` / `README.md` / `docs/`. Run once when adopting. |
@@ -95,7 +96,8 @@ Your agent calls these; you don't type them.
 
 `mem_context` deliberately returns **one-line summaries**, not full bodies. It runs at
 the start of every session; if it dumped everything, a repo with 50 memories would
-burn thousands of tokens before your first message.
+burn thousands of tokens before your first message. See
+[Capping the packet](#capping-the-packet) for hard limits.
 
 ```
 ## Recent decisions
@@ -106,6 +108,111 @@ burn thousands of tokens before your first message.
 
 The agent expands only what it needs with `mem_get`. This is why **every entry should
 have a `summary`** — it's the only thing most future sessions will ever read.
+
+### Scoping context to the task
+
+Recency is a decent default on a young repo and a poor one on a mature repo — the
+decision that bears on today's work is rarely the newest. Tell `mem_context` what the
+session is about and it ranks by relevance instead:
+
+```js
+mem_context({ task: "add rate limiting to the payments API" })
+```
+
+It uses the same BM25 + recency scoring as `mem_search`, so search and context can
+never disagree about what matters. Entries that don't match the task aren't hidden —
+they keep a zero score and fall back to recency order behind the ones that do. The
+headings change to **Relevant decisions / patterns / issues**, because "Recent" would
+be a lie once the list is relevance-ordered.
+
+### Capping the packet
+
+```js
+mem_context({ task: "rate limiting", budget: 800 })
+```
+
+`budget` is an approximate token ceiling for the whole packet. The budget is split so
+the prelude can't eat it: **25%** to the project profile, **35%** to the last session,
+the remainder to memory entries. Without that split, a tight budget produced a packet
+with a profile, a session, and no memory in it at all.
+
+Entries are then shed lowest-relevance first until the rendered packet actually fits —
+measured, not estimated. Whatever is dropped is always declared:
+
+```
+_9 further entries not shown (token budget 800) — find them with mem_search._
+```
+
+Below roughly 290 tokens a full packet cannot be built at all, so it degrades to the
+brief one-line summary plus what a packet would have cost, rather than quietly
+overshooting.
+
+Even with no budget set, each type is capped at **20** entries — previously the cap
+was 100, which on a long-lived repo was no cap at all.
+
+### Semantic search (optional, off by default)
+
+BM25 is precise when you know the vocabulary and useless when you don't — searching
+`cmd` will never find an entry that only says `npx shim`. Embeddings close that gap.
+
+**repomem ships no model and adds no dependency.** Bundling a local runtime would
+mean a ~100MB download on install and infrastructure to provision, which is exactly
+what this project exists to avoid. The provider is always something you already run:
+
+```jsonc
+// repomem.config.json — Ollama, the common local setup
+{
+  "semantic": { "provider": "ollama", "model": "nomic-embed-text" }
+}
+```
+
+```jsonc
+// …or any OpenAI-compatible endpoint
+{
+  "semantic": {
+    "provider": "openai-compatible",
+    "url": "https://api.example.com/v1/embeddings",
+    "model": "text-embedding-3-small",
+    "apiKeyEnv": "EMBEDDINGS_API_KEY"
+  }
+}
+```
+
+```jsonc
+// …or anything at all: reads text on stdin, prints a JSON array of floats
+{
+  "semantic": { "provider": "command", "command": "./my-embedder.sh" }
+}
+```
+
+Then build the index:
+
+```bash
+repomem embed          # ✔ Vector cache updated — 12 embedded, 0 reused
+```
+
+Re-run it after adding memory. Only entries whose content hash changed are
+re-embedded, so a second run over an unchanged repo makes no provider calls at all.
+
+**How results combine.** Semantic scores are blended with BM25, not substituted for
+it — `blend` (default `0.5`) is the semantic share. Entries only the vector index
+found are appended, so a semantic hit can surface memory lexical search could never
+reach. Both score sets are normalised to 0–1 first so neither dominates by scale.
+
+**It never breaks search.** No config, a missing cache, a stale cache from a
+different model, an unreachable provider, a provider that crashes — all degrade
+silently to plain BM25. Search failing is always worse than search being less clever.
+
+**Vectors are not memory.** The cache lives in `.repomem/.cache/` and is gitignored.
+Memory is markdown that travels in git; a re-derivable float array is a local build
+artifact, and committing one would put a model's output in your repo's history.
+
+Check the state any time:
+
+```console
+$ repomem status
+  semantic   ollama (nomic-embed-text) — 12 vector(s)
+```
 
 ### A normal session
 
@@ -126,6 +233,52 @@ Then commit. Nothing is shared with your team until you do:
 ```bash
 git add .repomem/ && git commit -m "chore: update memory"
 ```
+
+### Making it automatic
+
+The default flow depends on you remembering to ask. To remove that:
+
+```bash
+repomem setup claude-code --hooks
+```
+
+This installs two lifecycle hooks in `.claude/settings.json`, merging with whatever
+is already there:
+
+| Hook | Runs | Effect |
+|---|---|---|
+| `SessionStart` | `repomem context` | Every session opens warm — the profile, last session, and memory summaries load without the agent choosing to |
+
+| `SessionEnd` | `repomem capture` | What changed is recorded whether or not anyone asked |
+
+`repomem capture` writes a session file from git alone — no model, no tokens. It is
+careful about noise:
+
+- **Commits are events**, so anything in the window is new and always recorded.
+- **Uncommitted files are state** — they survive from one capture to the next. They
+  are recorded once, then only again when the file set actually changes. Otherwise
+  hooking capture to every session end would fill `sessions/` with near-identical
+  files.
+- Nothing changed means **nothing is written at all**.
+- The summary says outright that no human wrote it, rather than inventing intent it
+  cannot know: *"No summary was written by hand, so the intent behind this work is not
+  recorded."*
+
+A marker under `.repomem/.cache/` (gitignored) tracks the window between runs.
+
+Edit the `SessionStart` command to `repomem context --budget 600` if you want a hard
+ceiling on what gets injected into every session.
+
+Both commands no-op silently outside a repomem project, so the hooks are safe to
+install globally — a session in an unrelated repo is unaffected.
+
+Hooks are a Claude Code feature. Cursor, Gemini CLI, and Codex have no equivalent
+session lifecycle, so `--hooks` warns and skips for them. You can still wire
+`repomem capture` to a shell alias, a cron, or a git hook.
+
+⚠️ An auto-captured session records *what* changed, never *why*. It is a floor, not a
+replacement for asking your agent to save a decision — that judgement is the part
+worth keeping.
 
 ### What to say
 
@@ -148,26 +301,54 @@ worth loading degrades.
 
 ### Adopting on an existing project
 
-`repomem init` gives you empty folders. To seed them from a repo that already has
-years of context:
+`repomem init` scans the repo as it scaffolds — no agent, no model, no API key:
 
-```bash
-cd your-existing-project
-repomem init
-repomem setup claude-code
-# restart the agent
+```console
+$ repomem init
+✔ Created repomem.config.json (project: payments-service)
+✔ Initialised .repomem/ with decisions, sessions, patterns, issues
+
+✔ Wrote .repomem/project.md — 4 stack signal(s), 6 command(s), 9 top-level dir(s), git conventions
+  stack: Node.js + TypeScript, Express, Jest, Docker
+✔ Imported 12 ADR(s) into decisions/
 ```
 
-Then, in the agent:
+Two things happen automatically.
+
+**A project profile** is written to `.repomem/project.md` and inlined at the top of
+every `mem_context` packet — the stack, how to build/test/lint, entry points, the
+directory layout, CI workflows, plus conventions inferred from git history (commit
+style, release tags, and the files that churn most). This is what an agent otherwise
+rediscovers by globbing the tree at the start of every session.
+
+**Existing ADRs are imported.** If your repo has `docs/adr/`, `adr/`,
+`docs/decisions/`, or `rfcs/`, those files are already decision-shaped and are copied
+straight into `decisions/` — title, status, and date preserved. Each records its
+`source:`, so re-running skips what's already there instead of duplicating it.
+
+Regenerate either at any time:
+
+```bash
+repomem scan     # refresh project.md, import any new ADRs
+```
+
+**Prose docs still need judgement**, and that's what `mem_prime` is for. It gathers
+`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `README.md`, and `docs/**.md` and returns them
+with instructions to distil them into memory. Either ask your agent to call it, or
+pipe it from the shell:
+
+```bash
+repomem prime                    # print the packet
+repomem prime | your-agent       # or hand it straight to something
+```
 
 > "Call `mem_prime`, then save what it surfaces as decisions, patterns, and issues."
 
-`mem_prime` gathers `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `README.md`, and
-`docs/**.md` (up to 12 files) and returns them with instructions to distil them into
-memory. **It writes nothing itself** — it needs an agent in the loop. Re-running it is
-safe: it reads the existing count first and is told not to duplicate.
+It **writes nothing itself** — distilling prose needs a model. Re-running is safe: it
+reads the existing count first and is told not to duplicate.
 
-If your project has no docs, the higher-value move is to point the agent at the code:
+If your project has no docs at all, the higher-value move is to point the agent at the
+code:
 
 > "Read the source under `src/`, then save what you learned as decisions, patterns,
 > and issues. Give every entry a one-line summary and cross-link related entries."
@@ -281,8 +462,16 @@ sharing a prefix collide. Use short, distinct titles.
 
 ```
 repomem                      Start the MCP server (stdio) — how agents invoke it
-repomem init                 Scaffold .repomem/ and repomem.config.json
+repomem init                 Scaffold .repomem/, then scan the repo
+repomem scan                 Regenerate .repomem/project.md and import new ADRs
+repomem prime                Print the priming packet for an agent to distil
+repomem embed                Build the semantic vector cache (opt-in)
+repomem context              Print the session-start memory packet
+                             [--brief] [--task <what>] [--budget <tokens>]
+repomem capture              Record what changed since the last capture
 repomem setup <agent>        Wire repomem into claude-code | cursor | gemini | codex
+repomem setup <agent> --hooks
+                             …and install session hooks (Claude Code only)
 repomem status               Show memory counts, configured agents, linked repos
 repomem sync                 Export all memory to stdout
 repomem import [file]        Import a sync bundle (file or stdin) into .repomem/
@@ -401,11 +590,11 @@ your changes rather than the published package:
 - [x] `mem_prime` — bootstrap memory from an existing repo's docs
 - [x] One file per session, with names, timestamps, and agent attribution
 - [x] Git-derived handoffs — "what changed" comes from commits, not recollection
-- [ ] `init` learns the repo — stack, commands, layout, ADRs, and git conventions, without an LLM
-- [ ] `repomem prime` as a CLI, so onboarding can be scripted end-to-end
-- [ ] Auto-capture hooks, so memory does not depend on remembering to ask
-- [ ] Task-scoped `mem_context` and a token budget, for repos with lots of memory
-- [ ] Optional semantic search layer (off by default, local embedding cache)
+- [x] `init` learns the repo — stack, commands, layout, ADRs, and git conventions, without an LLM
+- [x] `repomem prime` as a CLI, so onboarding can be scripted end-to-end
+- [x] Auto-capture hooks, so memory does not depend on remembering to ask
+- [x] Task-scoped `mem_context` and a token budget, for repos with lots of memory
+- [x] Optional semantic search layer (off by default, bring-your-own provider)
 
 ---
 
@@ -421,10 +610,9 @@ and multi-repo search spans local paths, pulled GitHub remotes, and a shared wor
 from the MCP handshake, `mem_context` listing parallel same-day sessions, and
 git-derived handoffs. Landing in v0.4.
 
-**The known gap:** nothing is recorded unless the agent is asked. MCP servers are
-passive — they act only when a tool is called. Git-derived handoffs remove the recall
-burden once a handoff is requested, but *requesting* it is still manual. Auto-capture
-hooks are the planned fix.
+**On automation:** `repomem setup claude-code --hooks` makes memory load and record
+itself. What remains manual is the part that needs judgement — capturing *why* a
+decision was made. An auto-captured session is a floor, not a substitute.
 
 If this solves a problem you have, **star the repo** — it helps validate that this is
 worth building and tells me which features to prioritise.
