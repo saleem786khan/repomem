@@ -25,7 +25,7 @@ const TOOLS: ToolDef[] = [
 ];
 const TOOL_MAP = new Map(TOOLS.map((t) => [t.name, t]));
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 
 /** Build and start the repomem MCP server over stdio. */
 export async function startServer(): Promise<void> {

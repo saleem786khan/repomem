@@ -600,19 +600,24 @@ your changes rather than the published package:
 
 ## Status
 
-**v0.3.1 — working.** `init`, `setup`, `status`, `sync`, `import`, `pull`, and six MCP
-tools are implemented and covered by tests. Context is token-lean by default, memories
-cross-link with `[[wikilinks]]`, `mem_prime` bootstraps an existing repo from its docs,
-and multi-repo search spans local paths, pulled GitHub remotes, and a shared workspace.
+**v0.5.0 — working.** Ten CLI commands and six MCP tools, covered by 97 tests
+including a full-lifecycle end-to-end run against the shipped artifact.
 
-**On `master`, not yet published:** one file per session
-(`YYYY-MM-DD-HHMM-<name>.md`) with front matter, session naming, agent attribution
-from the MCP handshake, `mem_context` listing parallel same-day sessions, and
-git-derived handoffs. Landing in v0.4.
+`repomem init` on an existing repo now produces populated memory in one command,
+with no agent and no model: a project profile (stack, commands, layout, CI),
+conventions inferred from git history, and any ADRs the repo already has imported
+as decisions. Prose docs still need judgement — that is what `repomem prime` and
+`mem_prime` are for.
 
-**On automation:** `repomem setup claude-code --hooks` makes memory load and record
-itself. What remains manual is the part that needs judgement — capturing *why* a
-decision was made. An auto-captured session is a floor, not a substitute.
+`repomem setup claude-code --hooks` makes memory load and record itself, so it no
+longer depends on remembering to ask. Sessions are one file each, named and
+attributed, and handoffs derive what changed from git rather than from recollection.
+`mem_context` can be scoped to a task and capped to a token budget. Semantic search
+is available, off by default, and never bundles a model.
+
+**What stays manual:** capturing *why* a decision was made. An auto-captured session
+knows what changed and can never know the intent behind it — that judgement is the
+part worth keeping, and the part only you can supply.
 
 If this solves a problem you have, **star the repo** — it helps validate that this is
 worth building and tells me which features to prioritise.
