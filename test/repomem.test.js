@@ -361,6 +361,113 @@ test("mem_context drops Done from a long session but keeps Next and Blockers", (
   assert.match(raw, /finished task 0/, "the session file itself must keep everything");
 });
 
+// ---------------------------------------------------------------------------
+// task-scoped context and token budgets
+// ---------------------------------------------------------------------------
+
+/**
+ * A project where recency and relevance genuinely disagree: the entry that
+ * matters is the OLDEST, so anything ranking by date buries it. Dates are
+ * written into filenames directly — entries saved through mem_save all share
+ * today's date, which makes "recency" collapse into alphabetical order.
+ */
+function makeBusyProject() {
+  const root = makeProject();
+  const write = (type, date, slug, title, summary, body) =>
+    store.writeFile(
+      type,
+      `${date}-${slug}.md`,
+      `---\ndate: ${date}\nsummary: ${summary}\n---\n# ${title}\n\n${body}\n`,
+      {},
+      root
+    );
+
+  write("issues", "2020-01-01", "windows-spawn-fails", "Windows spawn fails",
+    "npx cannot be spawned on Windows", "npx is a cmd shim and ENOENTs");
+  write("decisions", "2020-01-02", "use-postgres", "Use Postgres",
+    "Postgres for transactions", "we need transactions");
+  write("patterns", "2020-01-03", "funnel-io", "Funnel IO through the store",
+    "IO goes through the store layer", "all reads go via file-store");
+
+  // Enough padding that a half-size budget still leaves room for entries —
+  // below roughly 150 tokens the packet floor dominates and the budget path
+  // degrades to the brief form instead, which is a different behaviour.
+  for (let i = 0; i < 18; i++) {
+    write("issues", `2026-07-${String(i + 1).padStart(2, "0")}`, `filler-${i}`,
+      `Filler issue ${i}`, `padding number ${i} about unrelated kittens and weather`,
+      "unrelated padding about kittens");
+  }
+  return root;
+}
+
+test("mem_context ranks by relevance when given a task", () => {
+  const root = makeBusyProject();
+
+  const byRecency = memContext.handler({}, root);
+  const recencyIssues = byRecency.split("## Known issues")[1];
+  assert.ok(
+    !recencyIssues.split("\n").slice(1, 3).join(" ").includes("Windows spawn"),
+    "without a task the oldest entry is nowhere near the top"
+  );
+
+  const byTask = memContext.handler({ task: "windows spawn ENOENT npx" }, root);
+  assert.match(byTask, /_Ranked by relevance to: windows spawn ENOENT npx_/);
+  assert.match(byTask, /## Relevant issues/, "headings must not claim recency order");
+  const taskIssues = byTask.split("## Relevant issues")[1];
+  assert.match(
+    taskIssues.split("\n")[1],
+    /Windows spawn fails/,
+    "the entry that bears on the task must lead"
+  );
+});
+
+test("mem_context respects a token budget and reports what it dropped", () => {
+  const root = makeBusyProject();
+  const full = memContext.handler({}, root);
+  const fullTokens = Math.ceil(full.length / 4);
+
+  const budget = Math.floor(fullTokens / 2);
+  const capped = memContext.handler({ task: "windows spawn", budget }, root);
+  assert.ok(
+    Math.ceil(capped.length / 4) <= budget,
+    `packet must fit the budget (${Math.ceil(capped.length / 4)} > ${budget})`
+  );
+  assert.match(capped, /further entries not shown \(token budget/, "no silent truncation");
+  assert.match(capped, /Windows spawn fails/, "what survives must be the most relevant");
+});
+
+test("mem_context falls back to the brief form when the budget is below the floor", () => {
+  const root = makeBusyProject();
+  const tiny = memContext.handler({ budget: 60 }, root);
+  assert.match(tiny, /decisions, .* patterns, .* issues/, "degrades to the one-line summary");
+  assert.match(tiny, /A full packet needs ~\d+ tokens but the budget was 60/);
+  assert.ok(!tiny.includes("## Known issues"), "no half-built packet");
+});
+
+test("mem_context caps entries per type even with no budget", () => {
+  const root = makeProject();
+  for (let i = 0; i < 30; i++) {
+    memSave.handler({ type: "issue", title: `Issue number ${i}`, content: "x" }, root);
+  }
+  const full = memContext.handler({}, root);
+  const listed = (full.split("## Known issues")[1] || "").match(/^- /gm) || [];
+  assert.ok(listed.length <= 20, `issues must be capped, got ${listed.length}`);
+  assert.match(full, /further entries not shown/, "the cap must be declared");
+});
+
+test("scoreEntries is the single ranking used by search and context", () => {
+  const root = makeBusyProject();
+  const scored = store.scoreEntries("windows spawn ENOENT", root);
+  assert.ok(scored.length > 0);
+  assert.match(scored[0].filename, /windows-spawn-fails/);
+  for (let i = 1; i < scored.length; i++) {
+    assert.ok(scored[i - 1].score >= scored[i].score, "must come back sorted");
+  }
+  // The same ranking must drive mem_search's top hit.
+  const searched = memSearch.handler({ query: "windows spawn ENOENT" }, root);
+  assert.match(searched.split("\n")[2], /Windows spawn fails/);
+});
+
 test("mem_handoff writes structured handoff and commit reminder", () => {
   const root = makeProject();
   const out = memHandoff.handler(
@@ -520,6 +627,308 @@ test("git.activitySince returns null outside a repo and data inside one", () => 
 });
 
 // ---------------------------------------------------------------------------
+// repo profiling and ADR import — what `init` can learn without a model.
+// ---------------------------------------------------------------------------
+const profile = require("../dist/store/profile.js");
+const adr = require("../dist/store/adr.js");
+
+test("scanProject reads stack, commands, and entry points from manifests", () => {
+  const root = makeProject();
+  fs.writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({
+      name: "widget",
+      type: "module",
+      main: "dist/index.js",
+      bin: { widget: "dist/cli.js" },
+      scripts: { build: "tsc", test: "node --test", lint: "eslint ." },
+      dependencies: { express: "^5", react: "^19" },
+      devDependencies: { typescript: "^6", vitest: "^2", eslint: "^9" },
+    })
+  );
+
+  const p = profile.scanProject(root);
+  assert.ok(p.stack.includes("Node.js + TypeScript"), "typescript devDep implies TS");
+  assert.ok(p.stack.includes("ESM (`type: module`)"));
+  assert.ok(p.stack.includes("Express") && p.stack.includes("React"));
+  assert.ok(p.stack.includes("Vitest") && p.stack.includes("ESLint"));
+  assert.ok(p.commands.some((c) => c.includes("npm run build") && c.includes("tsc")));
+  assert.ok(p.commands.some((c) => c.includes("npm run lint")));
+  assert.ok(p.entryPoints.some((e) => e.includes("dist/index.js")));
+  assert.ok(p.entryPoints.some((e) => e.includes("widget")));
+});
+
+test("scanProject detects non-Node stacks and Makefile targets", () => {
+  const root = makeProject();
+  fs.rmSync(path.join(root, "package.json"));
+  fs.writeFileSync(path.join(root, "go.mod"), "module example.com/x\n");
+  fs.writeFileSync(path.join(root, "Dockerfile"), "FROM golang\n");
+  fs.writeFileSync(path.join(root, "Makefile"), ".PHONY: build\nbuild:\n\tgo build\ndeploy:\n\techo\n");
+
+  const p = profile.scanProject(root);
+  assert.ok(p.stack.includes("Go"));
+  assert.ok(p.stack.includes("Docker"));
+  assert.ok(p.commands.some((c) => c.includes("go build ./...")));
+  const makeLine = p.commands.find((c) => c.startsWith("`make"));
+  assert.ok(makeLine, "Makefile targets must be listed");
+  assert.ok(makeLine.includes("build") && makeLine.includes("deploy"));
+  assert.ok(!makeLine.includes("PHONY"), "PHONY is not a target");
+});
+
+test("scanProject summarises layout and ignores build and vendor dirs", () => {
+  const root = makeProject();
+  for (const [dir, files] of [
+    ["src", ["a.ts", "b.ts", "c.ts"]],
+    ["docs", ["one.md"]],
+    ["node_modules", ["junk.js"]],
+    ["dist", ["out.js"]],
+  ]) {
+    fs.mkdirSync(path.join(root, dir), { recursive: true });
+    for (const f of files) fs.writeFileSync(path.join(root, dir, f), "x\n");
+  }
+
+  const p = profile.scanProject(root);
+  const dirs = p.layout.join(" ");
+  assert.match(dirs, /`src\/` — 3 files, mostly \.ts/);
+  assert.match(dirs, /`docs\/`/);
+  assert.ok(!dirs.includes("node_modules"), "dependencies say nothing about shape");
+  assert.ok(!dirs.includes("dist"), "build output says nothing about shape");
+});
+
+test("writeProfile writes .repomem/project.md and mem_context inlines it", () => {
+  const root = makeProject();
+  fs.writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({ name: "widget", scripts: { test: "node --test" } })
+  );
+  const written = profile.writeProfile(root);
+  assert.ok(written, "an initialised project must profile");
+
+  const raw = fs.readFileSync(path.join(root, ".repomem", "project.md"), "utf8");
+  assert.match(raw, /# widget — project profile/);
+  assert.match(raw, /Do not edit by hand/);
+
+  const full = memContext.handler({}, root);
+  assert.match(full, /## Commands/, "the profile belongs at the top of the packet");
+  assert.match(full, /npm run test/);
+});
+
+test("repoConventions infers commit style, tags, and hotspots from history", () => {
+  const gitStore = require("../dist/store/git.js");
+  const { root, run } = makeGitProject();
+  for (const [file, msg] of [
+    ["a.txt", "feat: add a"],
+    ["a.txt", "fix: correct a"],
+    ["b.txt", "feat: add b"],
+  ]) {
+    fs.writeFileSync(path.join(root, file), Math.random().toString());
+    run(["add", "."]);
+    run(["commit", "-q", "-m", msg]);
+  }
+  run(["tag", "v1.0.0"]);
+
+  const c = gitStore.repoConventions(root);
+  assert.ok(c.sampled >= 4);
+  assert.ok(c.conventionalShare > 0.5, "most subjects here are conventional");
+  assert.ok(c.topTypes.includes("feat"));
+  assert.deepEqual(c.tags, ["v1.0.0"]);
+  assert.ok(c.hotspots.some((h) => h.startsWith("a.txt")), "a.txt changed twice");
+
+  const p = profile.scanProject(root);
+  assert.ok(p.conventions.some((x) => /Conventional Commits/.test(x)));
+  assert.ok(p.conventions.some((x) => /v1\.0\.0/.test(x)));
+});
+
+test("importAdrs imports existing ADRs and is safe to re-run", () => {
+  const root = makeProject();
+  const adrDir = path.join(root, "docs", "adr");
+  fs.mkdirSync(adrDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(adrDir, "0001-use-postgres.md"),
+    "# Use Postgres\n\n## Status\n\nAccepted\n\n## Context\n\nWe need transactions.\n"
+  );
+  fs.writeFileSync(path.join(adrDir, "README.md"), "# Index\n\nnot a decision\n");
+
+  const first = adr.importAdrs(root);
+  assert.equal(first.imported.length, 1, "the index file must not be imported");
+  const filename = store.listFiles("decisions", root)[0];
+  const raw = store.readFile("decisions", filename, root);
+  assert.match(raw, /# Use Postgres/);
+  assert.match(raw, /We need transactions/);
+  assert.match(raw, /source: docs\/adr\/0001-use-postgres\.md/);
+  assert.match(raw, /generated: true/);
+  assert.match(store.summaryOf(raw, filename), /Accepted/);
+
+  const second = adr.importAdrs(root);
+  assert.equal(second.imported.length, 0, "re-running must not duplicate");
+  assert.equal(second.skipped, 1);
+  assert.equal(store.listFiles("decisions", root).length, 1);
+});
+
+test("findAdrs looks in the conventional directories", () => {
+  const root = makeProject();
+  for (const dir of ["adr", "docs/decisions", "rfcs"]) {
+    fs.mkdirSync(path.join(root, dir), { recursive: true });
+    fs.writeFileSync(path.join(root, dir, "0002-a-choice.md"), "# A choice\n\nbecause\n");
+  }
+  const found = adr.findAdrs(root);
+  assert.equal(found.length, 3);
+  assert.ok(found.every((f) => f.title === "A choice"));
+});
+
+// ---------------------------------------------------------------------------
+// optional semantic search — repomem ships the cache and the maths, never a
+// model, so these run against a local stub provider and never touch a network.
+// ---------------------------------------------------------------------------
+const embeddings = require("../dist/store/embeddings.js");
+
+const STUB_EMBEDDER = `
+const TOPICS = [
+  ["windows","cmd","spawn","enoent","npx","shim"],
+  ["database","postgres","sql","transaction"],
+];
+let text = "";
+process.stdin.on("data", d => text += d);
+process.stdin.on("end", () => {
+  const t = text.toLowerCase();
+  const v = TOPICS.map(ws => ws.reduce((n,w) => n + (t.includes(w) ? 1 : 0), 0));
+  process.stdout.write(JSON.stringify(v.some(Boolean) ? v : [0.01, 0.01]));
+});
+`;
+
+/** A project wired to a stub embedder, with two topically distinct entries. */
+function makeSemanticProject(extra = {}) {
+  const root = makeProject();
+  fs.writeFileSync(path.join(root, "embedder.js"), STUB_EMBEDDER);
+  const semantic = {
+    provider: "command",
+    command: process.execPath,
+    args: [path.join(root, "embedder.js")],
+    blend: 0.6,
+    ...extra,
+  };
+  fs.writeFileSync(
+    path.join(root, "repomem.config.json"),
+    JSON.stringify({ project: "sem", linked: [], semantic })
+  );
+  memSave.handler(
+    { type: "issue", title: "Server will not start on Windows", content: "The npx shim cannot be spawned; ENOENT results." },
+    root
+  );
+  memSave.handler(
+    { type: "decision", title: "Chose Postgres", content: "Settlement needs multi-row SQL transactions." },
+    root
+  );
+  return { root, semantic };
+}
+
+test("semantic search is off unless configured, and search stays synchronous", () => {
+  const root = makeProject();
+  memSave.handler({ type: "issue", title: "Flaky CI", content: "retry docker" }, root);
+  const result = memSearch.handler({ query: "docker" }, root);
+  assert.equal(typeof result, "string", "no config means no async, no embedding calls");
+  assert.match(result, /Found 1 match/);
+  assert.ok(!fs.existsSync(path.join(root, ".repomem", ".cache", "embeddings.json")));
+});
+
+test("buildIndex embeds once, then reuses unchanged entries", async () => {
+  const { root, semantic } = makeSemanticProject();
+
+  const first = await embeddings.buildIndex(root, semantic);
+  assert.equal(first.embedded, 2);
+  assert.equal(first.reused, 0);
+  assert.deepEqual(first.failed, []);
+
+  const second = await embeddings.buildIndex(root, semantic);
+  assert.equal(second.embedded, 0, "unchanged entries must not be re-embedded");
+  assert.equal(second.reused, 2);
+
+  // Editing one entry re-embeds only that one.
+  const file = store.listFiles("issues", root)[0];
+  store.writeFile("issues", file, "# Changed\n\nnow about spawn and npx on windows\n", {}, root);
+  const third = await embeddings.buildIndex(root, semantic);
+  assert.equal(third.embedded, 1);
+  assert.equal(third.reused, 1);
+});
+
+test("changing provider or model invalidates the whole cache", async () => {
+  const { root, semantic } = makeSemanticProject();
+  await embeddings.buildIndex(root, semantic);
+
+  // Vectors from a different model are not comparable, so none may be reused.
+  const rebuilt = await embeddings.buildIndex(root, { ...semantic, model: "other-model" });
+  assert.equal(rebuilt.reused, 0, "vectors from another model must not be mixed in");
+  assert.equal(rebuilt.embedded, 2);
+});
+
+test("semantic search surfaces entries lexical search cannot reach", async () => {
+  const { root, semantic } = makeSemanticProject();
+  await embeddings.buildIndex(root, semantic);
+
+  // "cmd" appears in no entry, so BM25 has nothing to match on.
+  assert.ok(
+    !store.listFiles("issues", root).some((f) => (store.readFile("issues", f, root) || "").includes("cmd")),
+    "fixture must not contain the query term"
+  );
+  const lexicalOnly = store.searchFiles("cmd", root);
+  assert.equal(lexicalOnly.length, 0, "BM25 alone finds nothing");
+
+  const blended = await memSearch.handler({ query: "cmd" }, root);
+  assert.match(blended, /Found 1 match/);
+  assert.match(blended, /Server will not start on Windows/);
+});
+
+test("a broken provider degrades to lexical search instead of failing", async () => {
+  const { root } = makeSemanticProject({ command: process.execPath, args: ["-e", "process.exit(3)"] });
+  // Nothing can be embedded, and nothing should blow up.
+  const result = await memSearch.handler({ query: "postgres" }, root);
+  assert.match(result, /Found 1 match/, "search must still work");
+  assert.match(result, /Chose Postgres/);
+});
+
+test("buildIndex reports entries it could not embed", async () => {
+  const { root } = makeSemanticProject();
+  const broken = { provider: "command", command: process.execPath, args: ["-e", "process.exit(1)"] };
+  const result = await embeddings.buildIndex(root, broken);
+  assert.equal(result.embedded, 0);
+  assert.equal(result.failed.length, 2, "failures are reported, not swallowed");
+});
+
+test("the vector cache is local state and is gitignored", async () => {
+  const { root, semantic } = makeSemanticProject();
+  await embeddings.buildIndex(root, semantic);
+  const cacheDir = path.join(root, ".repomem", ".cache");
+  assert.ok(fs.existsSync(path.join(cacheDir, "embeddings.json")));
+  assert.match(fs.readFileSync(path.join(cacheDir, ".gitignore"), "utf8"), /\*/);
+});
+
+test("cosine and normalise behave", () => {
+  assert.equal(embeddings.cosine([1, 0], [1, 0]), 1);
+  assert.equal(embeddings.cosine([1, 0], [0, 1]), 0);
+  assert.equal(embeddings.cosine([1, 0], [1, 2, 3]), 0, "mismatched lengths score zero");
+  assert.equal(embeddings.cosine([0, 0], [0, 0]), 0, "no divide by zero");
+
+  const scaled = embeddings.normalise(new Map([["a", 2], ["b", 1]]));
+  assert.equal(scaled.get("a"), 1);
+  assert.equal(scaled.get("b"), 0.5);
+  assert.equal(embeddings.normalise(new Map()).size, 0);
+});
+
+test("cli embed refuses politely when semantic search is not configured", () => {
+  const root = makeProject();
+  const { code, out } = cliResult(root, "embed");
+  assert.equal(code, 1);
+  assert.match(out, /Semantic search is off/);
+  assert.match(out, /repomem ships no model/);
+});
+
+test("cli embed builds the cache and status reports it", () => {
+  const { root } = makeSemanticProject();
+  assert.match(runCli(root, "embed"), /Vector cache updated — 2 embedded/);
+  assert.match(runCli(root, "status"), /semantic {3}command — 2 vector\(s\)/);
+});
+
+// ---------------------------------------------------------------------------
 // cli setup — runs the shipped CLI as a subprocess and checks the files each
 // agent actually reads for project-scoped MCP servers.
 // ---------------------------------------------------------------------------
@@ -602,6 +1011,195 @@ test("cli setup codex preserves existing TOML config", () => {
 test("cli setup rejects an unknown agent", () => {
   const root = makeProject();
   assert.throws(() => runCli(root, "setup", "notanagent"));
+});
+
+test("cli init scans the repo and reports what it learned", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "repomem-init-"));
+  fs.writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({ name: "widget", scripts: { test: "node --test" } })
+  );
+  const adrDir = path.join(root, "docs", "adr");
+  fs.mkdirSync(adrDir, { recursive: true });
+  fs.writeFileSync(path.join(adrDir, "0001-use-postgres.md"), "# Use Postgres\n\nbecause\n");
+
+  const out = runCli(root, "init");
+  assert.match(out, /Wrote \.repomem\/project\.md/);
+  assert.match(out, /Imported 1 ADR/);
+  assert.ok(fs.existsSync(path.join(root, ".repomem", "project.md")));
+  assert.equal(store.listFiles("decisions", root).length, 1);
+
+  // Re-running is safe and does not duplicate the import.
+  const again = runCli(root, "init");
+  assert.match(again, /already imported/);
+  assert.equal(store.listFiles("decisions", root).length, 1);
+});
+
+test("cli prime prints the same packet the MCP tool returns", () => {
+  const root = makeProject();
+  fs.writeFileSync(path.join(root, "README.md"), "# Widget\n\nIt widgets things.\n");
+  const out = runCli(root, "prime");
+  assert.match(out, /# repomem priming packet/);
+  assert.match(out, /It widgets things/);
+  assert.equal(out.trim(), memPrime.handler({}, root).trim());
+});
+
+// ---------------------------------------------------------------------------
+// auto-capture — memory that does not depend on remembering to ask.
+// ---------------------------------------------------------------------------
+const capture = require("../dist/store/capture.js");
+
+test("capture records new commits but does not re-record unchanged WIP", () => {
+  const { root, run } = makeGitProject();
+  fs.writeFileSync(path.join(root, "wip.txt"), "half done\n");
+
+  const first = capture.planCapture(root);
+  assert.equal(first.worthWriting, true, "new WIP is worth recording once");
+  assert.match(first.summary, /left uncommitted/);
+  capture.writeMarker(root, first.marker);
+
+  // Nothing has changed: capturing again must write nothing.
+  const second = capture.planCapture(root);
+  assert.equal(second.worthWriting, false, "unchanged WIP must not re-trigger");
+  capture.writeMarker(root, second.marker);
+
+  // A commit is an event, and always worth recording.
+  run(["add", "."]);
+  run(["commit", "-q", "-m", "feat: finish the wip"]);
+  const third = capture.planCapture(root);
+  assert.equal(third.worthWriting, true, "a new commit must be captured");
+  assert.match(third.summary, /1 commit/);
+});
+
+test("capture does not re-report a commit made in the same minute as the marker", () => {
+  // `git --since` resolves to the minute, so a commit made in the marker's own
+  // minute stays inside the time window and used to look new on every run —
+  // one auto session file per capture, forever. Commits are ranged now instead.
+  const { root, run } = makeGitProject();
+  fs.writeFileSync(path.join(root, "feature.txt"), "x\n");
+  run(["add", "."]);
+  run(["commit", "-q", "-m", "feat: land the feature"]);
+
+  const first = capture.planCapture(root);
+  assert.equal(first.worthWriting, true, "the commit is genuinely new the first time");
+  assert.match(first.summary, /1 commit/);
+  assert.ok(first.marker.head, "the marker must record HEAD to range from");
+  capture.writeMarker(root, first.marker);
+
+  const second = capture.planCapture(root);
+  assert.equal(second.worthWriting, false, "the same commit must not be reported twice");
+  capture.writeMarker(root, second.marker);
+  assert.equal(capture.planCapture(root).worthWriting, false, "and not on the run after that");
+});
+
+test("capture notices when the uncommitted set changes", () => {
+  const { root } = makeGitProject();
+  fs.writeFileSync(path.join(root, "one.txt"), "x\n");
+  capture.writeMarker(root, capture.planCapture(root).marker);
+  assert.equal(capture.planCapture(root).worthWriting, false);
+
+  fs.writeFileSync(path.join(root, "two.txt"), "y\n");
+  assert.equal(
+    capture.planCapture(root).worthWriting,
+    true,
+    "a different file set is new work"
+  );
+});
+
+test("capture says plainly that no human summary was written", () => {
+  const { root } = makeGitProject();
+  fs.writeFileSync(path.join(root, "wip.txt"), "x\n");
+  const plan = capture.planCapture(root);
+  assert.match(
+    plan.summary,
+    /intent behind this work is not recorded/,
+    "an auto summary must not pretend to understand the work"
+  );
+});
+
+test("capture is a no-op outside a git repo", () => {
+  const root = makeProject();
+  assert.equal(capture.planCapture(root).worthWriting, false);
+});
+
+test("cli capture writes one session, then stays quiet", () => {
+  const { root } = makeGitProject();
+  fs.writeFileSync(path.join(root, "wip.txt"), "x\n");
+
+  assert.match(runCli(root, "capture"), /Handoff written/);
+  assert.equal(store.listFiles("sessions", root).length, 1);
+
+  assert.match(runCli(root, "capture"), /Nothing new/);
+  assert.equal(
+    store.listFiles("sessions", root).length,
+    1,
+    "hooking capture to every session end must not litter sessions/"
+  );
+});
+
+test("cli setup --hooks installs lifecycle hooks without clobbering settings", () => {
+  const root = makeProject();
+  fs.mkdirSync(path.join(root, ".claude"), { recursive: true });
+  const settingsPath = path.join(root, ".claude", "settings.json");
+  fs.writeFileSync(settingsPath, JSON.stringify({ permissions: { allow: ["Bash(ls)"] } }));
+
+  const out = runCli(root, "setup", "claude-code", "--hooks");
+  assert.match(out, /Installed session hooks/);
+
+  const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  assert.deepEqual(settings.permissions.allow, ["Bash(ls)"], "existing settings survive");
+  assert.equal(settings.hooks.SessionStart[0].hooks[0].command, "repomem context");
+  assert.equal(settings.hooks.SessionEnd[0].hooks[0].command, "repomem capture");
+
+  runCli(root, "setup", "claude-code", "--hooks");
+  const again = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  assert.equal(again.hooks.SessionStart.length, 1, "re-running must not duplicate hooks");
+});
+
+test("cli setup --hooks is a no-op for agents without lifecycle hooks", () => {
+  const root = makeProject();
+  const out = runCli(root, "setup", "cursor", "--hooks");
+  assert.match(out, /no session lifecycle hooks/);
+  assert.ok(!fs.existsSync(path.join(root, ".claude", "settings.json")));
+});
+
+test("cli context prints the packet and stays silent outside a project", () => {
+  const root = makeProject();
+  memSave.handler({ type: "issue", title: "Watch out", content: "for the thing" }, root);
+  assert.match(runCli(root, "context"), /# Context for/);
+  assert.match(runCli(root, "context", "--brief"), /1 issues/);
+
+  // Hooks run in every repo, including ones that never adopted repomem.
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), "repomem-nohook-"));
+  const { code, out } = cliResult(bare, "context");
+  assert.equal(code, 0, "a hook must not fail a session in an unrelated repo");
+  assert.equal(out.trim(), "");
+});
+
+test("cli context passes --task and --budget through", () => {
+  const root = makeBusyProject();
+  const plain = runCli(root, "context");
+  assert.match(plain, /## Known issues/);
+
+  const scoped = runCli(root, "context", "--task", "windows spawn ENOENT");
+  assert.match(scoped, /_Ranked by relevance to: windows spawn ENOENT_/);
+  assert.match(scoped.split("## Relevant issues")[1].split("\n")[1], /Windows spawn fails/);
+
+  // A hook injects this into every session, so the cap has to hold from the CLI.
+  const capped = runCli(root, "context", "--budget", "300");
+  assert.ok(
+    Math.ceil(capped.trim().length / 4) <= 300,
+    `budget must bind from the CLI too, got ${Math.ceil(capped.trim().length / 4)}`
+  );
+});
+
+test("cli scan and prime guard an uninitialised project", () => {
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), "repomem-bare-"));
+  for (const cmd of ["scan", "prime"]) {
+    const { code, out } = cliResult(bare, cmd);
+    assert.equal(code, 1, `${cmd} must fail outside a repomem project`);
+    assert.match(out, /repomem init/);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -980,6 +1578,172 @@ test("e2e CLI: init → save (via MCP) → status → sync → import round-trip
   assert.equal(store.listFiles("patterns", b).length, 1);
   const pg = store.readFile("decisions", store.listFiles("decisions", b)[0], b);
   assert.match(pg, /summary: Redis for cache/, "front matter survives the round-trip");
+});
+
+/**
+ * The whole adoption story on a repo that predates repomem, driven only through
+ * the shipped artifact: CLI subprocesses and the MCP server over stdio. Nothing
+ * here imports dist/ directly, so it exercises what a user actually installs.
+ */
+test("e2e: adopting repomem on a legacy repo, start to finish", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "repomem-e2e-legacy-"));
+  const git = (args, env) =>
+    execFileSync("git", args, {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, ...env },
+    });
+
+  // ---- a repo with history, docs, ADRs, and CI, but no memory ----------------
+  fs.mkdirSync(path.join(root, "docs", "adr"), { recursive: true });
+  fs.mkdirSync(path.join(root, "src", "api"), { recursive: true });
+  fs.mkdirSync(path.join(root, ".github", "workflows"), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({
+      name: "@acme/payments-service",
+      main: "dist/index.js",
+      scripts: { build: "tsc", test: "jest" },
+      dependencies: { express: "^5" },
+      devDependencies: { typescript: "^5", jest: "^29" },
+    })
+  );
+  fs.writeFileSync(path.join(root, "README.md"), "# Payments\n\nSettles merchant batches nightly.\n");
+  fs.writeFileSync(path.join(root, "Dockerfile"), "FROM node:22\n");
+  fs.writeFileSync(path.join(root, ".github", "workflows", "ci.yml"), "name: ci\n");
+  fs.writeFileSync(path.join(root, "src", "api", "routes.ts"), "export const x = 1\n");
+  fs.writeFileSync(
+    path.join(root, "docs", "adr", "0001-use-postgres.md"),
+    "# Use Postgres over DynamoDB\n\n## Status\n\nAccepted\n\n## Context\n\nSettlement needs multi-row transactions.\n"
+  );
+  fs.writeFileSync(
+    path.join(root, "docs", "adr", "0002-idempotency-keys.md"),
+    "# Require idempotency keys\n\n## Status\n\nAccepted\n\n## Context\n\nGateway retries were double-charging.\n"
+  );
+
+  git(["init", "-q"]);
+  git(["config", "user.email", "e2e@example.com"]);
+  git(["config", "user.name", "E2E"]);
+  git(["add", "-A"]);
+  git(["commit", "-q", "-m", "feat: initial payments service"]);
+  git(["tag", "v1.2.0"]);
+  fs.appendFileSync(path.join(root, "src", "api", "routes.ts"), "export const y = 2\n");
+  git(["add", "-A"]);
+  git(["commit", "-q", "-m", "fix: correct the route handler"]);
+
+  // ---- 1. init learns the repo without a model -------------------------------
+  const init = runCli(root, "init");
+  assert.match(init, /Wrote \.repomem\/project\.md/);
+  assert.match(init, /Imported 2 ADR\(s\)/);
+
+  const profile = fs.readFileSync(path.join(root, ".repomem", "project.md"), "utf8");
+  for (const expected of [
+    /Node\.js \+ TypeScript/, /Express/, /Jest/, /Docker/,
+    /npm run build/, /npm run test/,
+    /main: dist\/index\.js/,
+    /`src\/`/, /`docs\/`/,
+    /\.github\/workflows\/ci\.yml/,
+    /Conventional Commits/, /v1\.2\.0/,
+    /src\/api\/routes\.ts/,
+  ]) {
+    assert.match(profile, expected, `profile must record ${expected}`);
+  }
+
+  // ---- 2. wiring, including the hooks that make it automatic -----------------
+  const setup = runCli(root, "setup", "claude-code", "--hooks");
+  assert.match(setup, /Wired repomem into Claude Code/);
+  assert.match(setup, /Installed session hooks/);
+  const mcpConfig = JSON.parse(fs.readFileSync(path.join(root, ".mcp.json"), "utf8"));
+  assert.deepEqual(mcpConfig.mcpServers.repomem, mcpEntry());
+  const settings = JSON.parse(fs.readFileSync(path.join(root, ".claude", "settings.json"), "utf8"));
+  assert.equal(settings.hooks.SessionStart[0].hooks[0].command, "repomem context");
+
+  // ---- 3. an agent connects and works ----------------------------------------
+  const [context, prime, saved, handoff, searched] = mcp(root, [
+    { name: "mem_context", arguments: {} },
+    { name: "mem_prime", arguments: {} },
+    {
+      name: "mem_save",
+      arguments: {
+        type: "issue",
+        title: "Batch job times out over 10k rows",
+        content: "Chunk the settlement batch.",
+        summary: "settlement batch times out past 10k rows",
+        links: ["use-postgres-over-dynamodb"],
+      },
+    },
+    { name: "mem_handoff", arguments: { summary: "looked at settlement", session: "settlement-work", next: ["chunk the batch"] } },
+    { name: "mem_search", arguments: { query: "settlement batch" } },
+  ]);
+
+  // The cold-start packet carries the profile and the imported decisions.
+  assert.match(context.text, /## Commands/);
+  assert.match(context.text, /npm run test/);
+  assert.match(context.text, /Use Postgres over DynamoDB/);
+  assert.match(context.text, /Require idempotency keys/);
+  assert.ok(!context.isError);
+
+  assert.match(prime.text, /repomem priming packet/);
+  assert.match(prime.text, /Settles merchant batches nightly/, "prose docs reach the agent");
+  assert.match(prime.text, /already has \d+ memory entries/, "priming must not re-seed blindly");
+
+  assert.match(saved.text, /Saved issues\//);
+  assert.match(handoff.text, /Handoff written to sessions\/.*settlement-work/);
+  assert.match(searched.text, /Batch job times out/);
+  assert.match(searched.text, /→ related: Use Postgres over DynamoDB/, "wikilinks resolve across imports");
+
+  // The handoff derived its own facts from git, and is attributed to the client.
+  const sessionFile = store.listFiles("sessions", root)[0];
+  assert.match(sessionFile, /^\d{4}-\d{2}-\d{2}-\d{4}-settlement-work\.md$/);
+  const sessionText = store.readFile("sessions", sessionFile, root);
+  assert.match(sessionText, /agent: test/, "clientInfo from the MCP handshake");
+  assert.match(sessionText, /_branch: \S+_/);
+  assert.match(sessionText, /\*\*Next:\*\*/);
+
+  // ---- 4. unattended capture, as the SessionEnd hook would run it -------------
+  fs.writeFileSync(path.join(root, "src", "api", "wip.ts"), "export const wip = true\n");
+  assert.match(runCli(root, "capture"), /Handoff written/);
+  assert.match(runCli(root, "capture"), /Nothing new/, "hooks must not litter sessions/");
+
+  // ---- 5. context stays within a budget when a hook injects it ---------------
+  const capped = runCli(root, "context", "--task", "settlement batching", "--budget", "400");
+  assert.ok(
+    Math.ceil(capped.trim().length / 4) <= 400,
+    `hook-injected context must respect its budget, got ${Math.ceil(capped.trim().length / 4)}`
+  );
+  assert.match(capped, /_Ranked by relevance to: settlement batching_/);
+
+  // ---- 6. opt-in semantic search, via a provider repomem does not ship --------
+  fs.writeFileSync(path.join(root, "embedder.js"), STUB_EMBEDDER);
+  const config = JSON.parse(fs.readFileSync(path.join(root, "repomem.config.json"), "utf8"));
+  config.semantic = {
+    provider: "command",
+    command: process.execPath,
+    args: [path.join(root, "embedder.js")],
+    blend: 0.6,
+  };
+  fs.writeFileSync(path.join(root, "repomem.config.json"), JSON.stringify(config, null, 2));
+
+  assert.match(runCli(root, "embed"), /Vector cache updated/);
+  const [semantic] = mcp(root, [{ name: "mem_search", arguments: { query: "postgres" } }]);
+  assert.match(semantic.text, /Use Postgres over DynamoDB/, "search still works with semantics on");
+
+  // ---- 7. the memory travels: export here, import into a fresh repo ----------
+  const bundle = runCli(root, "sync");
+  const teammate = initProject("teammate-svc");
+  fs.writeFileSync(path.join(teammate, "bundle.md"), bundle);
+  const imported = runCli(teammate, "import", "bundle.md");
+  assert.match(imported, /Imported \d+ file\(s\)/);
+  const [teammateContext] = mcp(teammate, [{ name: "mem_context", arguments: {} }]);
+  assert.match(teammateContext.text, /Use Postgres over DynamoDB/, "a clone inherits the memory");
+  assert.match(teammateContext.text, /Batch job times out/);
+
+  // ---- 8. status reflects the whole picture ----------------------------------
+  const status = runCli(root, "status");
+  assert.match(status, /repomem status — payments-service/);
+  assert.match(status, /agents {5}Claude Code/);
+  assert.match(status, /semantic {3}command/);
 });
 
 test("e2e CLI: subcommands guard, help, and pull-with-no-remotes behave", () => {
