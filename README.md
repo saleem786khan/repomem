@@ -437,24 +437,52 @@ Related: [[memory-lives-in-the-repo-as-plain-markdown]]
 
 - **`summary`** — the one line `mem_context` and `mem_search` show. Always set it.
 - **`tags`** — free-form, for retrieval.
-- **`supersedes`** — on a decision, the filename it replaces. Keeps the history.
+- **`supersedes`** — on a decision, the filename it replaces. The old entry is
+  stamped `superseded-by:` in return, so both sides of the replacement are visible.
+- **`status: resolved` / `resolved-by`** — on an issue, stamped when another entry
+  is saved with `resolves:`. A closed gotcha stops teaching itself.
 - **`[[wikilinks]]`** — resolve by slug regardless of date prefix. `mem_search` and
   `mem_context` traverse them and show `→ related:`, so linked entries travel together.
 
 Filenames are `YYYY-MM-DD-<slug>.md`. The date prefix is load-bearing: it drives
 newest-first ordering and the search recency boost.
 
-### Editing and correcting
+### Memory lifecycle — superseding, resolving, reviewing
 
-There's no update tool. Two paths:
+Memory has an end of life, not just a beginning. There's no update tool; there are
+three retirement paths:
 
-- **Superseding a decision** — `mem_save` with `supersedes: <filename>` records the
-  replacement and keeps the history. This is the intended path.
+- **Superseding a decision** — `mem_save` with `supersedes: <filename or slug>`
+  records the replacement *and stamps the old entry* with `superseded-by:`. The
+  dead decision drops out of `mem_context`, ranks far lower in search (labelled
+  `(superseded)`), and `mem_get` banners it before the body — so an agent can never
+  act on it unknowingly. History is kept, not deleted.
+- **Resolving an issue** — `mem_save` with `resolves: <filename or slug>` marks the
+  issue `status: resolved` with a `resolved-by:` pointer to the fixing entry. Same
+  demotion rules apply.
 - **Fixing a mistake** — just edit the markdown file. It's plain text in your repo.
 
-⚠️ Saving twice on the same day with the same title **overwrites silently** — the
-filename is `date-slug` and `slugify` truncates at 60 characters, so two long titles
-sharing a prefix collide. Use short, distinct titles.
+Retired entries are hidden from the session-start packet but never silently:
+`mem_context` reports how many it hid, and `mem_search` still finds them.
+
+The review cadence half comes in two parts. Commit-time review is free — memory is
+markdown that travels in PRs like any other change. Scheduled review is
+`repomem review`: a report (never a gate) of entries older than a threshold,
+long-open issues, broken `[[wikilinks]]`, and `supersedes` claims whose target was
+never stamped. Run it by hand, in CI, or on a cron:
+
+```
+$ repomem review --days 120
+repomem review — payments-service (stale after 120 days)
+
+• Aging entries — re-confirm or supersede (1)
+    decisions/2025-11-02-use-sqs-for-jobs.md — 268 days old — still true?
+• Long-open issues — fixed long ago, or truly open? (1)
+    issues/2026-01-14-flaky-ci.md — open for 195 days
+
+✔ 3 retired entries (superseded/resolved) correctly demoted
+2 finding(s). Retire with mem_save (supersedes/resolves), or edit the files directly.
+```
 
 ---
 
@@ -473,6 +501,7 @@ repomem setup <agent>        Wire repomem into claude-code | cursor | gemini | c
 repomem setup <agent> --hooks
                              …and install session hooks (Claude Code only)
 repomem status               Show memory counts, configured agents, linked repos
+repomem review [--days <n>]  Report stale entries, long-open issues, broken links
 repomem sync                 Export all memory to stdout
 repomem import [file]        Import a sync bundle (file or stdin) into .repomem/
 repomem pull                 Fetch remote linked repos' memory from GitHub
@@ -595,13 +624,19 @@ your changes rather than the published package:
 - [x] Auto-capture hooks, so memory does not depend on remembering to ask
 - [x] Task-scoped `mem_context` and a token budget, for repos with lots of memory
 - [x] Optional semantic search layer (off by default, bring-your-own provider)
+- [x] Memory lifecycle — `supersedes` back-stamps, `resolves` closes issues, retired entries demoted everywhere
+- [x] `repomem review` — staleness and consistency report for CI or cron
 
 ---
 
 ## Status
 
-**v0.5.0 — working.** Ten CLI commands and six MCP tools, covered by 97 tests
-including a full-lifecycle end-to-end run against the shipped artifact.
+**v0.6.0 — working.** Eleven CLI commands and six MCP tools, covered by 113 tests
+including full end-to-end runs against the shipped artifact.
+
+Memory now has a full lifecycle: decisions are superseded (both sides stamped),
+issues are resolved, retired entries drop out of context and sink in search, and
+`repomem review` reports what has gone stale or inconsistent.
 
 `repomem init` on an existing repo now produces populated memory in one command,
 with no agent and no model: a project profile (stack, commands, layout, CI),
