@@ -1767,3 +1767,233 @@ test("e2e CLI: subcommands guard, help, and pull-with-no-remotes behave", () => 
   const pull = runCli(root, "pull");
   assert.match(pull, /No remote linked repos/);
 });
+
+// ===========================================================================
+// memory lifecycle — supersede, resolve, retire, review
+// ===========================================================================
+
+test("mem_save supersedes stamps superseded-by on the old decision", () => {
+  const root = makeProject();
+  memSave.handler({ type: "decision", title: "Use REST for the API", content: "simple" }, root);
+  const out = memSave.handler(
+    { type: "decision", title: "Use gRPC for the API", content: "typed contracts", supersedes: "use-rest-for-the-api" },
+    root
+  );
+  assert.match(out, /supersedes decisions\/.*use-rest-for-the-api\.md — marked superseded/);
+
+  const files = store.listFiles("decisions", root);
+  const oldFile = files.find((f) => f.includes("use-rest"));
+  const newFile = files.find((f) => f.includes("use-grpc"));
+  const oldRaw = store.readFile("decisions", oldFile, root);
+  assert.match(oldRaw, new RegExp(`superseded-by: ${newFile}`), "old entry carries the back-reference");
+  assert.equal(store.isRetired(oldRaw), true);
+  assert.equal(store.isRetired(store.readFile("decisions", newFile, root)), false);
+  assert.equal(store.lifecycleOf(oldRaw).supersededBy, newFile);
+});
+
+test("a supersedes target that does not exist is reported, not invented", () => {
+  const root = makeProject();
+  const out = memSave.handler(
+    { type: "decision", title: "New way", content: "x", supersedes: "never-existed" },
+    root
+  );
+  assert.match(out, /supersedes never-existed — target not found/);
+});
+
+test("retired entries are demoted in search and labelled", () => {
+  const root = makeProject();
+  memSave.handler({ type: "decision", title: "Use REST transport", content: "the API transport choice" }, root);
+  memSave.handler(
+    { type: "decision", title: "Use gRPC transport", content: "the API transport choice", supersedes: "use-rest-transport" },
+    root
+  );
+  const results = store.searchFiles("transport choice", root);
+  assert.equal(results.length, 2, "superseded entries stay findable");
+  assert.match(results[0].title, /gRPC/, "the live entry must outrank its superseded twin");
+  const dead = results.find((r) => r.title.includes("REST"));
+  assert.match(dead.title, /\(superseded\)$/, "search must label dead entries");
+  assert.ok(results[0].score > dead.score * 2, "the penalty must be material, not cosmetic");
+});
+
+test("mem_context hides retired entries and says how many it hid", () => {
+  const root = makeProject();
+  memSave.handler({ type: "decision", title: "Use REST", content: "x" }, root);
+  memSave.handler({ type: "decision", title: "Use gRPC", content: "y", supersedes: "use-rest" }, root);
+  memSave.handler({ type: "issue", title: "Flaky CI", content: "retries" }, root);
+  memSave.handler({ type: "pattern", title: "Pin runners", content: "fixed", resolves: "flaky-ci" }, root);
+
+  const full = memContext.handler({}, root);
+  assert.match(full, /Use gRPC/);
+  assert.ok(!/^- Use REST —/m.test(full), "superseded decision must not be listed");
+  assert.ok(!full.includes("Flaky CI"), "resolved issue must not be listed");
+  assert.match(full, /2 retired entries \(superseded or resolved\) hidden/);
+});
+
+test("mem_save resolves marks the issue resolved with a back-reference", () => {
+  const root = makeProject();
+  memSave.handler({ type: "issue", title: "Flaky CI", content: "docker pull rate limits" }, root);
+  const out = memSave.handler(
+    { type: "pattern", title: "Mirror base images", content: "pull from the mirror", resolves: "flaky-ci" },
+    root
+  );
+  assert.match(out, /resolves issues\/.*flaky-ci\.md/);
+
+  const issueRaw = store.readFile("issues", store.listFiles("issues", root)[0], root);
+  assert.match(issueRaw, /status: resolved/);
+  assert.match(issueRaw, /resolved-by: .*mirror-base-images\.md/);
+  assert.equal(store.lifecycleOf(issueRaw).resolved, true);
+});
+
+test("mem_save resolves refuses to resolve a non-issue", () => {
+  const root = makeProject();
+  memSave.handler({ type: "decision", title: "Pick X", content: "x" }, root);
+  const out = memSave.handler(
+    { type: "pattern", title: "A pattern", content: "y", resolves: "pick-x" },
+    root
+  );
+  assert.match(out, /resolves pick-x — no matching issue found/);
+  const decisionRaw = store.readFile("decisions", store.listFiles("decisions", root)[0], root);
+  assert.ok(!decisionRaw.includes("status: resolved"), "decisions are superseded, never resolved");
+});
+
+test("mem_get banners a superseded entry before its body", () => {
+  const root = makeProject();
+  memSave.handler({ type: "decision", title: "Use REST", content: "old body" }, root);
+  memSave.handler({ type: "decision", title: "Use gRPC", content: "new", supersedes: "use-rest" }, root);
+  const out = memGet.handler({ file: "use-rest" }, root);
+  assert.match(out, /⚠ Superseded by .*use-grpc\.md — this entry is no longer current\./);
+  assert.ok(out.indexOf("Superseded by") < out.indexOf("old body"), "the warning must precede the body");
+});
+
+test("mem_get banners a resolved issue", () => {
+  const root = makeProject();
+  memSave.handler({ type: "issue", title: "Flaky CI", content: "issue body" }, root);
+  memSave.handler({ type: "pattern", title: "The fix", content: "fix", resolves: "flaky-ci" }, root);
+  const out = memGet.handler({ file: "flaky-ci" }, root);
+  assert.match(out, /⚠ Resolved by .*the-fix\.md — this issue is closed\./);
+});
+
+test("same-day same-slug saves get a numeric suffix instead of overwriting", () => {
+  const root = makeProject();
+  memSave.handler({ type: "issue", title: "Timeout in CI", content: "first" }, root);
+  memSave.handler({ type: "issue", title: "Timeout in CI!", content: "second" }, root);
+  memSave.handler({ type: "issue", title: "Timeout in CI?", content: "third" }, root);
+  const files = store.listFiles("issues", root);
+  assert.equal(files.length, 3, "colliding titles must never overwrite");
+  assert.ok(files.some((f) => f.endsWith("-timeout-in-ci.md")));
+  assert.ok(files.some((f) => f.endsWith("-timeout-in-ci-2.md")));
+  assert.ok(files.some((f) => f.endsWith("-timeout-in-ci-3.md")));
+  assert.match(store.readFile("issues", files.find((f) => f.endsWith("-2.md")), root), /second/);
+});
+
+test("search matches whole words, not substrings", () => {
+  const root = makeProject();
+  store.writeFile("patterns", "2026-07-01-a.md", "# a\nthe author wrote the module", {}, root);
+  store.writeFile("patterns", "2026-07-02-b.md", "# b\nthe auth flow uses jwt", {}, root);
+  const results = store.searchFiles("auth", root);
+  assert.equal(results.length, 1, '"auth" must not match "author"');
+  assert.match(results[0].file, /-b\.md$/);
+  // Terms with internal punctuation still match whole-token occurrences.
+  store.writeFile("patterns", "2026-07-03-c.md", "# c\nspawn via cmd.exe on windows", {}, root);
+  assert.equal(store.searchFiles("cmd.exe", root).length, 1);
+});
+
+test("the MCP server reports the package.json version", () => {
+  const { VERSION } = require("../dist/index.js");
+  assert.equal(VERSION, require("../package.json").version, "one version, one source of truth");
+});
+
+test("setFrontMatterField updates in place, appends, or creates the block", () => {
+  const root = makeProject();
+  store.writeFile("issues", "2026-07-01-x.md", "---\ndate: 2026-07-01\n---\n\n# X\nbody\n", {}, root);
+  store.setFrontMatterField("issues", "2026-07-01-x.md", "status", "resolved", root);
+  store.setFrontMatterField("issues", "2026-07-01-x.md", "status", "resolved", root); // idempotent
+  const raw = store.readFile("issues", "2026-07-01-x.md", root);
+  assert.equal(raw.match(/status: resolved/g).length, 1, "re-stamping must not duplicate the field");
+  assert.match(raw, /date: 2026-07-01/, "existing fields survive");
+  assert.match(raw, /# X/, "body survives");
+
+  store.writeFile("issues", "2026-07-02-y.md", "# Y\nno front matter here\n", {}, root);
+  store.setFrontMatterField("issues", "2026-07-02-y.md", "status", "resolved", root);
+  const y = store.readFile("issues", "2026-07-02-y.md", root);
+  assert.match(y, /^---\nstatus: resolved\n---\n/, "a block is created when missing");
+  assert.match(y, /# Y/);
+
+  assert.equal(store.setFrontMatterField("issues", "missing.md", "k", "v", root), false);
+});
+
+test("cli review reports stale entries, open issues, broken links, and unstamped supersedes", () => {
+  const root = makeProject();
+  store.writeFile("decisions", "2020-01-01-ancient-choice.md", "# Ancient choice\nsee [[gone-forever]]\n", {}, root);
+  store.writeFile("decisions", "2020-02-01-newer-choice.md", "---\nsupersedes: 2020-01-01-ancient-choice.md\n---\n\n# Newer choice\nx\n", {}, root);
+  store.writeFile("issues", "2020-03-01-old-wound.md", "# Old wound\nstill open?\n", {}, root);
+
+  const out = runCli(root, "review");
+  assert.match(out, /Aging entries/);
+  assert.match(out, /decisions\/2020-01-01-ancient-choice\.md — \d+ days old/);
+  assert.match(out, /Long-open issues/);
+  assert.match(out, /issues\/2020-03-01-old-wound\.md — open for \d+ days/);
+  assert.match(out, /Broken wikilinks/);
+  assert.match(out, /\[\[gone-forever\]\] resolves to nothing/);
+  assert.match(out, /supersedes without a back-reference/);
+  assert.match(out, /finding\(s\)/);
+});
+
+test("cli review is quiet when memory is healthy, and respects --days", () => {
+  const root = makeProject();
+  memSave.handler({ type: "decision", title: "Fresh choice", content: "made today" }, root);
+  assert.match(runCli(root, "review"), /Nothing needs attention/);
+
+  // A nonsense --days must fall back to the default, not crash or go to zero.
+  assert.match(runCli(root, "review", "--days", "banana"), /stale after 180 days/);
+  store.writeFile("decisions", "2020-01-01-old.md", "# Old\nx\n", {}, root);
+  const scoped = runCli(root, "review", "--days", "30");
+  assert.match(scoped, /stale after 30 days/);
+  assert.match(scoped, /2020-01-01-old\.md/);
+  assert.ok(!scoped.includes("fresh-choice"), "today's entry is inside a 30-day window");
+});
+
+test("cli review counts retired entries and guards an uninitialised project", () => {
+  const root = makeProject();
+  memSave.handler({ type: "issue", title: "A gotcha", content: "x" }, root);
+  memSave.handler({ type: "pattern", title: "The cure", content: "y", resolves: "a-gotcha" }, root);
+  assert.match(runCli(root, "review"), /1 retired entry \(superseded\/resolved\) correctly demoted/);
+
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), "repomem-review-bare-"));
+  const { code, out } = cliResult(bare, "review");
+  assert.equal(code, 1);
+  assert.match(out, /repomem init/);
+});
+
+test("e2e MCP: the lifecycle round-trips through the protocol", () => {
+  const root = initProject("@acme/lifecycle");
+  const [, , , ctx, getOld] = mcp(root, [
+    { name: "mem_save", arguments: { type: "decision", title: "Use REST", content: "simple to start" } },
+    { name: "mem_save", arguments: { type: "issue", title: "Slow cold starts", content: "lambda spin-up" } },
+    {
+      name: "mem_save",
+      arguments: {
+        type: "decision",
+        title: "Use gRPC",
+        content: "typed and fast; also fixes the cold starts",
+        supersedes: "use-rest",
+        resolves: "slow-cold-starts",
+      },
+    },
+    { name: "mem_context", arguments: {} },
+    { name: "mem_get", arguments: { file: "use-rest" } },
+  ]);
+
+  assert.match(ctx.text, /Use gRPC/);
+  assert.ok(!/^- Use REST —/m.test(ctx.text), "context must not list the dead decision");
+  assert.ok(!ctx.text.includes("Slow cold starts"), "context must not list the resolved issue");
+  assert.match(ctx.text, /2 retired entries/);
+  assert.match(getOld.text, /⚠ Superseded by/);
+
+  // The index labels retirement for humans browsing .repomem/ directly.
+  const index = fs.readFileSync(path.join(root, ".repomem", "REPOMEM.md"), "utf8");
+  assert.match(index, /\[Use REST\]\(decisions\/.*\) _\(superseded\)_/);
+  assert.match(index, /\[Slow cold starts\]\(issues\/.*\) _\(resolved\)_/);
+
+  assert.match(runCli(root, "review"), /retired entr/);
+});
