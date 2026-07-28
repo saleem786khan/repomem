@@ -2,6 +2,7 @@
 date: 2026-07-26
 summary: mem_prime is MCP-only, so adopting repomem on an existing repo needs a running agent — init/setup alone seed nothing.
 tags: [onboarding, cli, gap]
+status: resolved
 ---
 # mem_prime has no CLI equivalent
 

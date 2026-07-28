@@ -2,6 +2,8 @@
 date: 2026-07-26
 summary: Search counts raw substring occurrences, so "auth" matches "author" and short query terms produce noisy hits.
 tags: [search, gotcha]
+status: resolved
+resolved-by: 2026-07-28-memory-lifecycle-is-first-class.md
 ---
 # Search matches substrings, not words
 

@@ -2,6 +2,8 @@
 date: 2026-07-26
 summary: Two same-day saves whose titles slugify identically silently overwrite each other — slugify truncates at 60 chars.
 tags: [data-loss, mem-save]
+status: resolved
+resolved-by: 2026-07-28-memory-lifecycle-is-first-class.md
 ---
 # Same-day slug collisions overwrite silently
 

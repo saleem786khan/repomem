@@ -2,6 +2,8 @@
 date: 2026-07-26
 summary: The version string lives in both package.json and a hardcoded VERSION const in src/index.ts — bump one and the MCP server misreports itself.
 tags: [release, maintenance]
+status: resolved
+resolved-by: 2026-07-28-memory-lifecycle-is-first-class.md
 ---
 # Version is duplicated across package.json and index.ts
 

@@ -2,7 +2,6 @@
 date: 2026-07-26
 summary: Semantic search is optional and never bundles a model — the embedding provider is always one the user already runs.
 tags: [search, embeddings, dependencies]
-supersedes: 2026-07-26-bm25-recency-ranking-instead-of-embeddings.md
 ---
 # Semantic search is bring-your-own-provider
 
