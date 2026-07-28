@@ -1,6 +1,7 @@
 import {
   MEMORY_TYPES,
   MemoryType,
+  lifecycleOf,
   readFile,
   resolveLink,
   relatedOf,
@@ -55,7 +56,20 @@ export const memGet: ToolDef = {
     if (raw == null) return `✖ Could not read ${target.type}/${target.filename}.`;
 
     const related = relatedOf(raw, projectRoot);
-    const out = [`# ${target.type}/${target.filename}`, "", raw.trim()];
+    const out = [`# ${target.type}/${target.filename}`, ""];
+
+    // An agent expanding a dead entry must see that it is dead before the body.
+    const lc = lifecycleOf(raw);
+    if (lc.supersededBy) {
+      out.push(`⚠ Superseded by ${lc.supersededBy} — this entry is no longer current.`, "");
+    } else if (lc.resolved) {
+      out.push(
+        `⚠ Resolved${lc.resolvedBy ? ` by ${lc.resolvedBy}` : ""} — this issue is closed.`,
+        ""
+      );
+    }
+
+    out.push(raw.trim());
     if (related.length) {
       out.push("", "---", "Related entries (fetch with mem_get):");
       for (const r of related) out.push(`- ${r.title}  ·  ${r.type}/${r.filename}`);

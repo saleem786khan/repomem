@@ -3,6 +3,7 @@ import {
   readFile,
   counts,
   isInitialized,
+  isRetired,
   scoreEntries,
   summaryOf,
   MemoryType,
@@ -148,8 +149,15 @@ interface Candidate {
  * than whatever happens to be newest. Entries that do not match the task keep a
  * zero score and fall back to recency order, so nothing is hidden outright;
  * it is only pushed down.
+ *
+ * Retired entries — superseded decisions, resolved issues — are excluded and
+ * counted instead: a packet loaded every session must not keep re-teaching
+ * knowledge the repo has already moved past.
  */
-function rankCandidates(task: string, projectRoot: string): Candidate[] {
+function rankCandidates(
+  task: string,
+  projectRoot: string
+): { candidates: Candidate[]; retired: number } {
   const scores = new Map<string, number>();
   if (task) {
     for (const entry of scoreEntries(task, projectRoot)) {
@@ -157,10 +165,15 @@ function rankCandidates(task: string, projectRoot: string): Candidate[] {
     }
   }
 
+  let retired = 0;
   const candidates: Candidate[] = [];
   for (const { type } of LISTED) {
     for (const filename of listFiles(type, projectRoot)) {
       const raw = readFile(type, filename, projectRoot) ?? "";
+      if (isRetired(raw)) {
+        retired++;
+        continue;
+      }
       candidates.push({
         type,
         filename,
@@ -171,9 +184,10 @@ function rankCandidates(task: string, projectRoot: string): Candidate[] {
     }
   }
 
-  return candidates.sort((a, b) =>
+  candidates.sort((a, b) =>
     b.score === a.score ? b.order.localeCompare(a.order) : b.score - a.score
   );
+  return { candidates, retired };
 }
 
 export const memContext: ToolDef = {
@@ -294,7 +308,7 @@ export const memContext: ToolDef = {
     // provided the structural text still to come is also paid for. Headings and
     // closing notes are emitted after the entries are chosen, so reserve them
     // now or the packet overshoots by however much they cost.
-    const ranked = rankCandidates(task, projectRoot);
+    const { candidates: ranked, retired } = rankCandidates(task, projectRoot);
 
     // The per-type cap binds during selection, not at render time: capping while
     // printing would drop entries that were never counted as dropped.
@@ -328,6 +342,12 @@ export const memContext: ToolDef = {
         lines.push(
           `_${dropped} further ${dropped === 1 ? "entry" : "entries"} not shown` +
             `${budget ? ` (token budget ${budget})` : ""} — find them with mem_search._`
+        );
+      }
+      if (retired > 0) {
+        lines.push(
+          `_${retired} retired ${retired === 1 ? "entry" : "entries"} (superseded or ` +
+            "resolved) hidden — mem_search still finds them._"
         );
       }
       lines.push('_Expand any entry with mem_get("type/filename"). Search with mem_search._');

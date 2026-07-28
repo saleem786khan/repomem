@@ -24,6 +24,7 @@ import { parseRemote, fetchRemoteRepomem, RemoteRef } from "./store/remote.js";
 import { writeProfile, PROFILE_FILENAME } from "./store/profile.js";
 import { importAdrs } from "./store/adr.js";
 import { planCapture, writeMarker } from "./store/capture.js";
+import { reviewMemory, findingCount, DEFAULT_STALE_DAYS, ReviewFinding } from "./store/review.js";
 import { buildIndex, readCache } from "./store/embeddings.js";
 import { memPrime } from "./tools/mem-prime.js";
 import { memContext } from "./tools/mem-context.js";
@@ -538,6 +539,46 @@ function cmdImport(fileArg?: string): void {
   for (const f of written) console.log(`  ${f}`);
 }
 
+/** repomem review — report memory that needs a human eye; never a gate. */
+function cmdReview(argv: string[]): void {
+  const root = cwd();
+  if (!isInitialized(root)) {
+    console.error("✖ .repomem/ not found here. Run `repomem init` first.");
+    process.exitCode = 1;
+    return;
+  }
+
+  const daysIdx = argv.indexOf("--days");
+  const parsed = daysIdx !== -1 ? Number(argv[daysIdx + 1]) : NaN;
+  const staleDays = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_STALE_DAYS;
+
+  const config = loadConfig(root);
+  const report = reviewMemory(root, staleDays);
+  console.log(`repomem review — ${config.project} (stale after ${staleDays} days)`);
+  console.log("");
+
+  const section = (title: string, findings: ReviewFinding[]) => {
+    if (findings.length === 0) return;
+    console.log(`• ${title} (${findings.length})`);
+    for (const f of findings) console.log(`    ${f.file} — ${f.detail}`);
+    console.log("");
+  };
+
+  section("Aging entries — re-confirm or supersede", report.stale);
+  section("Long-open issues — fixed long ago, or truly open?", report.openIssues);
+  section("Broken wikilinks", report.brokenLinks);
+  section("supersedes without a back-reference (predates v0.6.0 — re-save to stamp)", report.unstampedSupersedes);
+
+  if (report.retired > 0) {
+    console.log(`✔ ${report.retired} retired entr${report.retired === 1 ? "y" : "ies"} (superseded/resolved) correctly demoted`);
+  }
+  if (findingCount(report) === 0) {
+    console.log("✔ Nothing needs attention.");
+  } else {
+    console.log(`${findingCount(report)} finding(s). Retire with mem_save (supersedes/resolves), or edit the files directly.`);
+  }
+}
+
 function cmdHelp(): void {
   console.log(`repomem — git-native memory for AI coding agents
 
@@ -556,6 +597,7 @@ Usage:
                                …and install session hooks (Claude Code only)
                                so memory loads and records itself
   repomem status               Show memory counts and configured agents
+  repomem review [--days <n>]  Report stale entries, long-open issues, and broken links
   repomem sync                 Export all memory to stdout
   repomem import [file]        Import a sync bundle (file or stdin) into .repomem/
   repomem pull                 Fetch remote linked repos' memory from GitHub
@@ -593,6 +635,9 @@ async function main(): Promise<void> {
       return;
     case "status":
       cmdStatus();
+      return;
+    case "review":
+      cmdReview(process.argv.slice(3));
       return;
     case "sync":
       cmdSync();

@@ -137,9 +137,65 @@ function frontMatter(raw: string): string {
 }
 
 /** Read a single scalar front-matter field, or null. */
-function fmField(raw: string, key: string): string | null {
+export function fmField(raw: string, key: string): string | null {
   const m = frontMatter(raw).match(new RegExp(`^\\s*${key}:\\s*(.+)$`, "m"));
   return m ? m[1].trim() : null;
+}
+
+export interface Lifecycle {
+  /** Filename of the entry that replaced this one, if any. */
+  supersededBy: string | null;
+  /** True when the entry (an issue) carries `status: resolved`. */
+  resolved: boolean;
+  /** Filename of the entry that resolved this one, if recorded. */
+  resolvedBy: string | null;
+}
+
+/** Lifecycle state carried in an entry's front matter. */
+export function lifecycleOf(raw: string): Lifecycle {
+  const status = fmField(raw, "status");
+  return {
+    supersededBy: fmField(raw, "superseded-by"),
+    resolved: status !== null && status.toLowerCase() === "resolved",
+    resolvedBy: fmField(raw, "resolved-by"),
+  };
+}
+
+/** True when an entry has been retired — superseded or resolved. */
+export function isRetired(raw: string): boolean {
+  const lc = lifecycleOf(raw);
+  return lc.supersededBy !== null || lc.resolved;
+}
+
+/**
+ * Set (or replace) a scalar front-matter field on an existing entry, creating a
+ * front-matter block when the file has none. Returns false when the file is
+ * missing. This is how lifecycle stamps (`superseded-by`, `status`) land on
+ * entries written before the stamp existed.
+ */
+export function setFrontMatterField(
+  type: MemoryType,
+  filename: string,
+  key: string,
+  value: string,
+  projectRoot: string = findProjectRoot()
+): boolean {
+  const raw = readFile(type, filename, projectRoot);
+  if (raw == null) return false;
+  const line = `${key}: ${value}`;
+
+  let next: string;
+  const end = raw.startsWith("---") ? raw.indexOf("\n---", 3) : -1;
+  if (end !== -1) {
+    let inner = raw.slice(3, end);
+    const keyRe = new RegExp(`^\\s*${key}:.*$`, "m");
+    inner = keyRe.test(inner) ? inner.replace(keyRe, line) : `${inner}\n${line}`;
+    next = "---" + inner + raw.slice(end);
+  } else {
+    next = `---\n${line}\n---\n\n${raw}`;
+  }
+  writeFile(type, filename, next, {}, projectRoot);
+  return true;
 }
 
 /**
@@ -291,6 +347,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const BM25_K1 = 1.5;
 const BM25_B = 0.75;
 
+// Retired entries (superseded decisions, resolved issues) stay findable but
+// must never outrank live memory that matches equally well.
+const RETIRED_PENALTY = 0.25;
+
 interface Doc {
   file: string;
   type: MemoryType;
@@ -302,7 +362,7 @@ interface Doc {
 }
 
 /** Best-effort timestamp for a memory: leading YYYY-MM-DD in the name, else mtime. */
-function docDateMs(type: MemoryType, filename: string, projectRoot: string): number {
+export function docDateMs(type: MemoryType, filename: string, projectRoot: string): number {
   const m = filename.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (m) {
     const t = Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`);
@@ -315,15 +375,15 @@ function docDateMs(type: MemoryType, filename: string, projectRoot: string): num
   }
 }
 
-/** Count non-overlapping occurrences of `term` in `haystack` (already lower-cased). */
+/**
+ * Count whole-word occurrences of `term` in `haystack` (both lower-cased).
+ * Lookarounds instead of \b so terms with internal punctuation ("cmd.exe",
+ * "file-store") still match; a bare substring count made "auth" hit "author".
+ */
 function countTerm(haystack: string, term: string): number {
-  let n = 0;
-  let idx = haystack.indexOf(term);
-  while (idx !== -1) {
-    n += 1;
-    idx = haystack.indexOf(term, idx + term.length);
-  }
-  return n;
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`(?<![a-z0-9])${escaped}(?![a-z0-9])`, "g");
+  return (haystack.match(re) ?? []).length;
 }
 
 export interface ScoredEntry {
@@ -405,6 +465,7 @@ export function scoreEntries(query: string, projectRoot: string): ScoredEntry[] 
     const ageDays = doc.dateMs > 0 ? Math.max(0, (now - doc.dateMs) / DAY_MS) : Infinity;
     const recency = 1 + RECENCY_WEIGHT * Math.exp(-ageDays / RECENCY_HALFLIFE_DAYS);
     score *= recency;
+    if (isRetired(doc.raw)) score *= RETIRED_PENALTY;
     if (score <= 0) continue;
 
     scored.push({
@@ -434,10 +495,12 @@ function searchInRoot(
 
   return scoreEntries(query, projectRoot).map((entry) => {
     const { body } = splitFrontMatter(entry.raw);
+    const lc = lifecycleOf(entry.raw);
+    const mark = lc.supersededBy ? " (superseded)" : lc.resolved ? " (resolved)" : "";
     return {
       file: entry.file,
       scope,
-      title: titleOf(entry.raw, entry.filename),
+      title: titleOf(entry.raw, entry.filename) + mark,
       excerpt: makeExcerpt(body, terms),
       score: entry.score,
       related: relatedOf(entry.raw, projectRoot).map((r) => r.title),
@@ -632,7 +695,9 @@ export function generateIndex(
     } else {
       for (const filename of files) {
         const raw = readFile(type, filename, projectRoot) ?? "";
-        lines.push(`- [${titleOf(raw, filename)}](${type}/${filename})`);
+        const lc = lifecycleOf(raw);
+        const mark = lc.supersededBy ? " _(superseded)_" : lc.resolved ? " _(resolved)_" : "";
+        lines.push(`- [${titleOf(raw, filename)}](${type}/${filename})${mark}`);
       }
     }
     lines.push("");

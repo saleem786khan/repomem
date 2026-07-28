@@ -8,6 +8,8 @@ import {
   generateIndex,
   getRepomemRoot,
   isInitialized,
+  resolveLink,
+  setFrontMatterField,
 } from "../store/file-store.js";
 import { ToolDef, today, timestamp, slugify, str, strArray } from "./util.js";
 import { nameSession, reserveSessionFile, sessionFrontMatter } from "./session.js";
@@ -74,7 +76,14 @@ export const memSave: ToolDef = {
       supersedes: {
         type: "string",
         description:
-          "Optional filename of a prior decision this one replaces (decisions only).",
+          "Optional filename or slug of a prior decision this one replaces. The old " +
+          "entry is stamped superseded-by and demoted in context and search.",
+      },
+      resolves: {
+        type: "string",
+        description:
+          "Optional filename or slug of an issue this entry resolves. The issue is " +
+          "marked status: resolved and drops out of session-start context.",
       },
       session: {
         type: "string",
@@ -128,18 +137,50 @@ export const memSave: ToolDef = {
       return `✔ Appended to sessions/${filename}\n\nRemember to: git add .repomem/ && git commit`;
     }
 
-    const filename = `${today()}-${slugify(title)}.md`;
+    // Same-day saves whose titles slugify identically used to overwrite each
+    // other silently; a numeric suffix keeps every save.
+    const dir = path.join(getRepomemRoot(projectRoot), type);
+    const base = `${today()}-${slugify(title)}`;
+    let filename = `${base}.md`;
+    for (let n = 2; fs.existsSync(path.join(dir, filename)); n++) {
+      filename = `${base}-${n}.md`;
+    }
+
+    // Stamp lifecycle back-references BEFORE writing the new file, so the
+    // slug resolution below can never match the entry being saved.
+    const notes: string[] = [];
+    if (supersedes) {
+      const target = resolveLink(supersedes, projectRoot);
+      if (target && setFrontMatterField(target.type, target.filename, "superseded-by", filename, projectRoot)) {
+        notes.push(`supersedes ${target.type}/${target.filename} — marked superseded`);
+      } else {
+        notes.push(`supersedes ${supersedes} — target not found, no back-reference stamped`);
+      }
+    }
+    const resolves = str(args.resolves);
+    if (resolves) {
+      const target = resolveLink(resolves, projectRoot);
+      if (target && target.type === "issues") {
+        setFrontMatterField("issues", target.filename, "status", "resolved", projectRoot);
+        setFrontMatterField("issues", target.filename, "resolved-by", filename, projectRoot);
+        notes.push(`resolves issues/${target.filename}`);
+      } else {
+        notes.push(`resolves ${resolves} — no matching issue found`);
+      }
+    }
+
     const fm: string[] = ["---", `date: ${today()}`];
     if (summary) fm.push(`summary: ${summary.replace(/\n+/g, " ").trim()}`);
     if (tags.length) fm.push(`tags: [${tags.join(", ")}]`);
     if (supersedes) fm.push(`supersedes: ${supersedes}`);
+    if (resolves) fm.push(`resolves: ${resolves}`);
     fm.push("---", "");
 
     const body = `# ${title}\n\n${content}\n${linkLine}`;
     writeFile(type, filename, fm.join("\n") + body, {}, projectRoot);
     generateIndex(projectRoot);
 
-    const note = supersedes ? ` (supersedes ${supersedes})` : "";
+    const note = notes.length ? ` (${notes.join("; ")})` : "";
     return `✔ Saved ${type}/${filename}${note}\n\nRemember to: git add .repomem/ && git commit`;
   },
 };

@@ -25,7 +25,10 @@ const TOOLS: ToolDef[] = [
 ];
 const TOOL_MAP = new Map(TOOLS.map((t) => [t.name, t]));
 
-const VERSION = "0.5.0";
+// Single source of truth is package.json — a hardcoded copy here drifted on
+// past releases and made the server misreport itself. dist/index.js sits one
+// level below the package root, so the relative path holds at runtime.
+export const VERSION: string = require("../package.json").version;
 
 /** Build and start the repomem MCP server over stdio. */
 export async function startServer(): Promise<void> {
